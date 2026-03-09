@@ -40,9 +40,9 @@ dev = [
 publicdotcom-mcp-server = "publicdotcom_mcp_server.server:main"
 
 [project.urls]
-Homepage = "https://github.com/tarricsookdeo/publicdotcom-mcp-server"
-Repository = "https://github.com/tarricsookdeo/publicdotcom-mcp-server"
-Issues = "https://github.com/tarricsookdeo/publicdotcom-mcp-server/issues"
+Homepage = "https://github.com/publicdotcom/publicdotcom-mcp-server"
+Repository = "https://github.com/publicdotcom/publicdotcom-mcp-server"
+Issues = "https://github.com/publicdotcom/publicdotcom-mcp-server/issues"
 "Public.com API" = "https://public.com/api"
 
 [tool.hatch.build.targets.wheel]
