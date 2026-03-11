@@ -5,18 +5,21 @@ Exposes Public.com brokerage functionality as MCP tools for use with
 any MCP-compatible AI client (Claude, etc.).
 
 Requires:
-  - PUBLIC_COM_SECRET environment variable (API key)
+  - PUBLIC_COM_SECRET environment variable (API key) — can also be passed
+    per-request via the Authorization: Bearer <key> HTTP header.
   - PUBLIC_COM_ACCOUNT_ID environment variable (optional default account)
 """
 
 import json
 import logging
 import os
+from contextvars import ContextVar
 from decimal import Decimal
 from typing import Any, Optional
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ---------------------------------------------------------------------------
 # SDK import — installed via `pip install publicdotcom-py`
@@ -53,6 +56,12 @@ from public_api_sdk.models import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Per-request context (populated by ApiKeyMiddleware for HTTP transport)
+# ---------------------------------------------------------------------------
+_api_key: ContextVar[str] = ContextVar("api_key", default="")
+_account_id: ContextVar[str] = ContextVar("account_id", default="")
+
+# ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
@@ -71,14 +80,20 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 def _get_client(account_id: Optional[str] = None) -> AsyncPublicApiClient:
-    """Create an async SDK client from environment variables."""
-    secret = os.environ.get("PUBLIC_COM_SECRET")
+    """Create an async SDK client.
+
+    The API key is resolved in priority order:
+      1. Per-request Authorization header (HTTP transport)
+      2. PUBLIC_COM_SECRET environment variable (stdio / fallback)
+    """
+    secret = _api_key.get() or os.environ.get("PUBLIC_COM_SECRET")
     if not secret:
         raise RuntimeError(
-            "PUBLIC_COM_SECRET environment variable is not set. "
-            "Get your API key at https://public.com/settings/v2/api"
+            "No API key found. Set the PUBLIC_COM_SECRET environment variable "
+            "or pass 'Authorization: Bearer <key>' in the request header. "
+            "Get your key at https://public.com/settings/v2/api"
         )
-    acct = account_id or os.environ.get("PUBLIC_COM_ACCOUNT_ID")
+    acct = account_id or _account_id.get() or os.environ.get("PUBLIC_COM_ACCOUNT_ID")
     return AsyncPublicApiClient(
         auth_config=ApiKeyAuthConfig(api_secret_key=secret),
         config=AsyncPublicApiClientConfiguration(
@@ -1190,12 +1205,60 @@ async def cancel_and_replace_order(
 
 
 # ========================================================================
+# ASGI middleware — extracts API key from Authorization header
+# ========================================================================
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Populate per-request ContextVars from HTTP headers.
+
+    Clients should send:
+        Authorization: Bearer <PUBLIC_COM_SECRET>
+
+    Optionally also:
+        X-Account-Id: <account_number>
+
+    Falls back to environment variables when headers are absent (useful for
+    single-tenant deployments where the key is baked into the environment).
+    """
+
+    async def dispatch(self, request, call_next):
+        auth = request.headers.get("Authorization", "")
+        key = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        acct = request.headers.get("X-Account-Id", "")
+
+        key_token = _api_key.set(key or os.environ.get("PUBLIC_COM_SECRET", ""))
+        acct_token = _account_id.set(acct or os.environ.get("PUBLIC_COM_ACCOUNT_ID", ""))
+        try:
+            return await call_next(request)
+        finally:
+            _api_key.reset(key_token)
+            _account_id.reset(acct_token)
+
+
+# ========================================================================
 # Entry point
 # ========================================================================
 
 def main():
-    """Run the MCP server."""
-    mcp.run(transport="stdio")
+    """Run the MCP server.
+
+    Transport is selected via the MCP_TRANSPORT environment variable:
+      - "streamable-http" (default) — for hosted/remote deployments
+      - "stdio"                     — for local Claude Desktop use
+
+    HTTP server binds to HOST (default 0.0.0.0) and PORT (default 8000).
+    """
+    import uvicorn
+
+    transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        host = os.environ.get("HOST", "0.0.0.0")
+        port = int(os.environ.get("PORT", "8000"))
+        app = ApiKeyMiddleware(mcp.streamable_http_app())
+        uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

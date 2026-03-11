@@ -27,6 +27,8 @@ classifiers = [
 dependencies = [
     "mcp>=1.0.0",
     "publicdotcom-py~=0.1.10",
+    "starlette>=0.27.0",
+    "uvicorn>=0.29.0",
 ]
 
 [project.optional-dependencies]
