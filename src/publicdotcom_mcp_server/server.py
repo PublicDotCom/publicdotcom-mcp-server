@@ -712,11 +712,15 @@ async def preflight_multileg_order(
 
     Args:
         legs: List of leg objects. Each leg must have:
-            - symbol (str): The symbol
+            - symbol (str): The option/equity symbol (e.g. "SPY260313P00670000")
             - type (str): EQUITY or OPTION
             - side (str): BUY or SELL
             - open_close_indicator (str, optional): OPEN or CLOSE (required for options)
-            - ratio_quantity (int, optional): Ratio between legs
+            - ratio_quantity (int, optional): Ratio between legs (default 1)
+          Example: [{"symbol": "SPY260313P00670000", "type": "OPTION", "side": "SELL",
+                     "open_close_indicator": "OPEN", "ratio_quantity": 1},
+                    {"symbol": "SPY260313P00665000", "type": "OPTION", "side": "BUY",
+                     "open_close_indicator": "OPEN", "ratio_quantity": 1}]
         limit_price: The limit price for the spread.
         time_in_force: DAY or GTD. Default is DAY.
         quantity: Number of spreads. Must be > 0.
@@ -739,10 +743,15 @@ async def preflight_multileg_order(
 
         leg_requests = []
         for leg in legs:
+            # Support both flat format {"symbol": ..., "type": ...} and
+            # nested format {"instrument": {"symbol": ..., "type": ...}, ...}
+            instrument = leg.get("instrument") or {}
+            symbol = instrument.get("symbol") or leg["symbol"]
+            inst_type = instrument.get("type") or leg["type"]
             leg_kwargs: dict[str, Any] = {
                 "instrument": LegInstrument(
-                    symbol=leg["symbol"],
-                    type=LegInstrumentType(leg["type"].upper()),
+                    symbol=symbol,
+                    type=LegInstrumentType(inst_type.upper()),
                 ),
                 "side": OrderSide(leg["side"].upper()),
             }
@@ -930,11 +939,15 @@ async def place_multileg_order(
 
     Args:
         legs: List of leg objects. Each leg must have:
-            - symbol (str): The symbol
+            - symbol (str): The option/equity symbol (e.g. "SPY260313P00670000")
             - type (str): EQUITY or OPTION
             - side (str): BUY or SELL
             - open_close_indicator (str, optional): OPEN or CLOSE (required for options)
-            - ratio_quantity (int, optional): Ratio between legs
+            - ratio_quantity (int, optional): Ratio between legs (default 1)
+          Example: [{"symbol": "SPY260313P00670000", "type": "OPTION", "side": "SELL",
+                     "open_close_indicator": "OPEN", "ratio_quantity": 1},
+                    {"symbol": "SPY260313P00665000", "type": "OPTION", "side": "BUY",
+                     "open_close_indicator": "OPEN", "ratio_quantity": 1}]
         quantity: Number of spreads. Must be > 0.
         limit_price: Limit price. Positive for debit, negative for credit.
         time_in_force: DAY or GTD. Default is DAY.
@@ -959,10 +972,15 @@ async def place_multileg_order(
 
         leg_requests = []
         for leg in legs:
+            # Support both flat format {"symbol": ..., "type": ...} and
+            # nested format {"instrument": {"symbol": ..., "type": ...}, ...}
+            instrument = leg.get("instrument") or {}
+            symbol = instrument.get("symbol") or leg["symbol"]
+            inst_type = instrument.get("type") or leg["type"]
             leg_kwargs: dict[str, Any] = {
                 "instrument": LegInstrument(
-                    symbol=leg["symbol"],
-                    type=LegInstrumentType(leg["type"].upper()),
+                    symbol=symbol,
+                    type=LegInstrumentType(inst_type.upper()),
                 ),
                 "side": OrderSide(leg["side"].upper()),
             }
