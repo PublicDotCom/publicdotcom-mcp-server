@@ -93,6 +93,8 @@ def _serialize(obj: Any) -> str:
     def _default(o: Any) -> Any:
         if isinstance(o, Decimal):
             return str(o)
+        if hasattr(o, "isoformat"):
+            return o.isoformat()
         if hasattr(o, "model_dump"):
             return o.model_dump(by_alias=True, exclude_none=True)
         if hasattr(o, "value"):
@@ -192,7 +194,7 @@ async def check_setup() -> str:
         try:
             accounts = await client.get_accounts()
             acct_list = [
-                f"  - {a.account_number} ({a.account_type.value})"
+                f"  - {a.account_id} ({a.account_type.value})"
                 for a in accounts.accounts
             ]
             default = os.environ.get("PUBLIC_COM_ACCOUNT_ID", "(not set)")
@@ -277,7 +279,7 @@ async def get_orders(account_id: Optional[str] = None) -> str:
     try:
         async with _get_client(account_id) as client:
             portfolio = await client.get_portfolio(account_id=account_id)
-            orders = portfolio.open_orders or []
+            orders = portfolio.orders or []
             return _serialize(orders)
     except Exception as e:
         logger.error("get_orders failed: %s", e, exc_info=True)
