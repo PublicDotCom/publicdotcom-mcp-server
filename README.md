@@ -53,7 +53,7 @@ pip install publicdotcom-mcp-server
 Or install from source:
 
 ```bash
-git clone https://github.com/tarricsookdeo/publicdotcom-mcp-server.git
+git clone https://github.com/publicdotcom/publicdotcom-mcp-server.git
 cd publicdotcom-mcp-server
 pip install .
 ```
@@ -129,7 +129,7 @@ npx @modelcontextprotocol/inspector publicdotcom-mcp-server
 
 ```bash
 # Clone and install in development mode
-git clone https://github.com/tarricsookdeo/publicdotcom-mcp-server.git
+git clone https://github.com/publicdotcom/publicdotcom-mcp-server.git
 cd publicdotcom-mcp-server
 pip install -e ".[dev]"
 

@@ -77,3 +77,8 @@ async def test_preflight_order_validation(patch_get_client, description, overrid
         f"Expected '{error_fragment}' in error response for: {description}\n"
         f"Got: {result}"
     )
+    # preflight errors are plain strings (not JSON) — confirm it's not accidentally
+    # returning a success JSON payload
+    assert not result.strip().startswith("{"), (
+        f"Expected plain error string for: {description}, got JSON: {result}"
+    )

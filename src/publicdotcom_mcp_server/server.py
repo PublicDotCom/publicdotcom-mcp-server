@@ -190,8 +190,8 @@ async def check_setup() -> str:
             "Set it with: export PUBLIC_COM_SECRET=your_api_key\n"
             "Get your key at https://public.com/settings/v2/api"
         )
-    async with _get_client() as client:
-        try:
+    try:
+        async with _get_client() as client:
             accounts = await client.get_accounts()
             acct_list = [
                 f"  - {a.account_id} ({a.account_type.value})"
@@ -203,8 +203,8 @@ async def check_setup() -> str:
                 f"Accounts found:\n" + "\n".join(acct_list) + "\n"
                 f"Default account ID: {default}"
             )
-        except Exception as e:
-            return f"❌ Authentication failed: {e}"
+    except Exception as e:
+        return f"❌ Authentication failed: {e}"
 
 
 @mcp.tool(
@@ -269,7 +269,7 @@ async def get_orders(account_id: Optional[str] = None) -> str:
     """
     Get all open/active orders on the account.
 
-    Fetches the account portfolio and returns only the open_orders list.
+    Fetches the account portfolio and returns only the orders list.
     Returns order details including symbol, side, type, status, quantity,
     and prices.
 
@@ -456,13 +456,13 @@ async def get_all_instruments(
             Valid: BUY_AND_SELL, LIQUIDATION_ONLY, DISABLED.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
-    req_kwargs: dict[str, Any] = {}
-    if type_filter:
-        req_kwargs["type_filter"] = [_parse_instrument_type(t) for t in type_filter]
-    if trading_filter:
-        req_kwargs["trading_filter"] = [Trading(t.upper()) for t in trading_filter]
-
     try:
+        req_kwargs: dict[str, Any] = {}
+        if type_filter:
+            req_kwargs["type_filter"] = [_parse_instrument_type(t) for t in type_filter]
+        if trading_filter:
+            req_kwargs["trading_filter"] = [Trading(t.upper()) for t in trading_filter]
+
         req = InstrumentsRequest(**req_kwargs) if req_kwargs else None
         async with _get_client(account_id) as client:
             instruments = await client.get_all_instruments(
@@ -1118,18 +1118,15 @@ async def cancel_and_replace_order(
     request_id = str(uuid4())
 
     try:
-        if order_type.upper() in ("LIMIT", "STOP_LIMIT") and limit_price is None:
-            raise ValueError(f"limit_price is required for {order_type} orders")
-        if order_type.upper() in ("STOP", "STOP_LIMIT") and stop_price is None:
-            raise ValueError(f"stop_price is required for {order_type} orders")
-        if time_in_force.upper() == "GTD" and expiration_time is None:
-            raise ValueError("expiration_time is required when time_in_force is GTD")
-        for field_name, raw_value in [("quantity", quantity), ("limit_price", limit_price), ("stop_price", stop_price)]:
-            if raw_value is not None:
-                try:
-                    Decimal(raw_value)
-                except Exception:
-                    raise ValueError(f"{field_name} must be a numeric string, got: {raw_value!r}")
+        _validate_order_params(
+            quantity=quantity,
+            amount=None,
+            order_type=order_type,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            time_in_force=time_in_force,
+            expiration_time=expiration_time,
+        )
 
         exp_kwargs: dict[str, Any] = {"time_in_force": TimeInForce(time_in_force.upper())}
         if expiration_time:

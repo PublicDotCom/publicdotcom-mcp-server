@@ -5,9 +5,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from publicdotcom_mcp_server.server import (
+    check_setup,
     get_accounts,
+    get_all_instruments,
     get_history,
     get_instrument,
+    get_option_chain,
+    get_option_expirations,
     get_option_greeks,
     get_order,
     get_orders,
@@ -74,7 +78,7 @@ class TestGetOrders:
         mock_client = patch_get_client
         mock_order = _make_model({"order_id": "abc-123", "status": "OPEN"})
         mock_portfolio = MagicMock()
-        mock_portfolio.open_orders = [mock_order]
+        mock_portfolio.orders = [mock_order]
         mock_client.get_portfolio = AsyncMock(return_value=mock_portfolio)
 
         result = await get_orders()
@@ -82,10 +86,10 @@ class TestGetOrders:
         assert len(data) == 1
         assert data[0]["order_id"] == "abc-123"
 
-    async def test_returns_empty_list_when_no_open_orders(self, patch_get_client):
+    async def test_returns_empty_list_when_no_orders(self, patch_get_client):
         mock_client = patch_get_client
         mock_portfolio = MagicMock()
-        mock_portfolio.open_orders = None
+        mock_portfolio.orders = None
         mock_client.get_portfolio = AsyncMock(return_value=mock_portfolio)
 
         result = await get_orders()
@@ -188,4 +192,108 @@ class TestGetOptionGreeks:
         mock_client.get_option_greeks = AsyncMock(side_effect=Exception("bad symbol"))
 
         result = await get_option_greeks(osi_symbols=["INVALID"])
+        assert "Error" in result
+
+
+class TestCheckSetup:
+    async def test_missing_secret_returns_error_without_api_call(self, monkeypatch):
+        monkeypatch.delenv("PUBLIC_COM_SECRET", raising=False)
+        result = await check_setup()
+        assert "PUBLIC_COM_SECRET" in result
+        assert "❌" in result
+
+    async def test_successful_auth_returns_account_list(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_account = MagicMock()
+        mock_account.account_id = "acct-123"
+        mock_account.account_type.value = "BROKERAGE"
+        mock_accounts = MagicMock()
+        mock_accounts.accounts = [mock_account]
+        mock_client.get_accounts = AsyncMock(return_value=mock_accounts)
+
+        result = await check_setup()
+        assert "✅" in result
+        assert "acct-123" in result
+        assert "BROKERAGE" in result
+
+    async def test_api_error_returns_auth_failed_message(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_accounts = AsyncMock(side_effect=Exception("invalid key"))
+
+        result = await check_setup()
+        assert "❌" in result
+        assert "Authentication failed" in result
+        assert "invalid key" in result
+
+
+class TestGetAllInstruments:
+    async def test_returns_instruments(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_all_instruments = AsyncMock(
+            return_value=_make_model({"instruments": []})
+        )
+
+        result = await get_all_instruments()
+        assert '"instruments"' in result
+
+    async def test_invalid_type_filter_returns_error(self, patch_get_client):
+        result = await get_all_instruments(type_filter=["INVALID"])
+        assert "Error" in result
+
+    async def test_invalid_trading_filter_returns_error(self, patch_get_client):
+        result = await get_all_instruments(trading_filter=["INVALID_TRADING_STATUS"])
+        assert "Error" in result
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_all_instruments = AsyncMock(side_effect=Exception("timeout"))
+
+        result = await get_all_instruments()
+        assert "Error" in result
+
+
+class TestGetOptionExpirations:
+    async def test_returns_expirations(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_option_expirations = AsyncMock(
+            return_value=_make_model({"expiration_dates": ["2026-03-21", "2026-04-17"]})
+        )
+
+        result = await get_option_expirations(symbol="AAPL")
+        assert "expiration_dates" in result
+
+    async def test_invalid_instrument_type_returns_error(self, patch_get_client):
+        result = await get_option_expirations(symbol="AAPL", instrument_type="INVALID")
+        assert "Error" in result
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_option_expirations = AsyncMock(side_effect=Exception("not found"))
+
+        result = await get_option_expirations(symbol="AAPL")
+        assert "Error" in result
+
+
+class TestGetOptionChain:
+    async def test_returns_option_chain(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_option_chain = AsyncMock(
+            return_value=_make_model({"calls": [], "puts": []})
+        )
+
+        result = await get_option_chain(symbol="AAPL", expiration_date="2026-03-21")
+        assert "calls" in result
+        assert "puts" in result
+
+    async def test_invalid_instrument_type_returns_error(self, patch_get_client):
+        result = await get_option_chain(
+            symbol="AAPL", expiration_date="2026-03-21", instrument_type="INVALID"
+        )
+        assert "Error" in result
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_option_chain = AsyncMock(side_effect=Exception("no chain"))
+
+        result = await get_option_chain(symbol="AAPL", expiration_date="2026-03-21")
         assert "Error" in result
