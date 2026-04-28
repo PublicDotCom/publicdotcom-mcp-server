@@ -600,6 +600,36 @@ async def get_option_greeks(
         return f"Error: {e}"
 
 
+@mcp.tool(
+    annotations={
+        "title": "Get Option Greek",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_option_greek(
+    osi_symbol: str,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Get option Greeks (delta, gamma, theta, vega, rho, IV) for a single option symbol.
+
+    Args:
+        osi_symbol: OSI-normalized option symbol (e.g. "AAPL260320C00280000").
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    try:
+        async with _get_client(account_id) as client:
+            result = await client.get_option_greek(
+                osi_symbol=osi_symbol, account_id=account_id
+            )
+            return _serialize(result)
+    except Exception as e:
+        logger.error("get_option_greek failed (osi_symbol=%s): %s", osi_symbol, e, exc_info=True)
+        return f"Error: {e}"
+
+
 # ========================================================================
 # PREFLIGHT (cost estimation) — READ-ONLY
 # ========================================================================
@@ -795,6 +825,289 @@ async def preflight_multileg_order(
             return _serialize(result)
     except Exception as e:
         logger.error("preflight_multileg_order failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Preflight Short Order",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def preflight_short_order(
+    symbol: str,
+    quantity: str,
+    order_type: str = "MARKET",
+    time_in_force: str = "DAY",
+    limit_price: Optional[str] = None,
+    stop_price: Optional[str] = None,
+    expiration_time: Optional[str] = None,
+    equity_market_session: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Estimate costs for a short-sale equity order before placing it.
+
+    Returns estimated commission, fees, and buying power impact.
+    Does NOT place an order.
+
+    Args:
+        symbol: Ticker symbol to short (e.g. "AAPL").
+        quantity: Number of shares to short.
+        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT. Default is MARKET.
+        time_in_force: DAY or GTD. Default is DAY.
+        limit_price: Required for LIMIT and STOP_LIMIT orders.
+        stop_price: Required for STOP and STOP_LIMIT orders.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        equity_market_session: CORE or EXTENDED.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    try:
+        _validate_order_params(
+            quantity=quantity,
+            amount=None,
+            order_type=order_type,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            time_in_force=time_in_force,
+            expiration_time=expiration_time,
+        )
+        kwargs: dict[str, Any] = {
+            "symbol": symbol,
+            "quantity": Decimal(quantity),
+            "order_type": OrderType(order_type.upper()),
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if limit_price is not None:
+            kwargs["limit_price"] = Decimal(limit_price)
+        if stop_price is not None:
+            kwargs["stop_price"] = Decimal(stop_price)
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+        if equity_market_session:
+            kwargs["equity_market_session"] = EquityMarketSession(equity_market_session.upper())
+
+        async with _get_client(account_id) as client:
+            result = await client.preflight_short_order(account_id=account_id, **kwargs)
+            return _serialize(result)
+    except Exception as e:
+        logger.error("preflight_short_order failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Preflight Call Credit Spread",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def preflight_call_credit_spread(
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str = "DAY",
+    expiration_time: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Estimate costs for a Bear Call Spread (call credit spread) before placing it.
+
+    Sell a lower-strike call, buy a higher-strike call. Receives a net credit.
+    Does NOT place an order.
+
+    Args:
+        sell_contract_osi: OSI symbol of the call to sell (lower strike).
+        buy_contract_osi: OSI symbol of the call to buy (higher strike).
+        quantity: Number of spreads.
+        limit_price: Net credit to receive per spread (positive = credit received).
+        time_in_force: DAY or GTD. Default is DAY.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        async with _get_client(account_id) as client:
+            result = await client.preflight_call_credit_spread(account_id=account_id, **kwargs)
+            return _serialize(result)
+    except Exception as e:
+        logger.error("preflight_call_credit_spread failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Preflight Call Debit Spread",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def preflight_call_debit_spread(
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str = "DAY",
+    expiration_time: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Estimate costs for a Bull Call Spread (call debit spread) before placing it.
+
+    Buy a lower-strike call, sell a higher-strike call. Pays a net debit.
+    Does NOT place an order.
+
+    Args:
+        sell_contract_osi: OSI symbol of the call to sell (higher strike).
+        buy_contract_osi: OSI symbol of the call to buy (lower strike).
+        quantity: Number of spreads.
+        limit_price: Net debit to pay per spread (positive = debit paid).
+        time_in_force: DAY or GTD. Default is DAY.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        async with _get_client(account_id) as client:
+            result = await client.preflight_call_debit_spread(account_id=account_id, **kwargs)
+            return _serialize(result)
+    except Exception as e:
+        logger.error("preflight_call_debit_spread failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Preflight Put Credit Spread",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def preflight_put_credit_spread(
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str = "DAY",
+    expiration_time: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Estimate costs for a Bull Put Spread (put credit spread) before placing it.
+
+    Sell a higher-strike put, buy a lower-strike put. Receives a net credit.
+    Does NOT place an order.
+
+    Args:
+        sell_contract_osi: OSI symbol of the put to sell (higher strike).
+        buy_contract_osi: OSI symbol of the put to buy (lower strike).
+        quantity: Number of spreads.
+        limit_price: Net credit to receive per spread (positive = credit received).
+        time_in_force: DAY or GTD. Default is DAY.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        async with _get_client(account_id) as client:
+            result = await client.preflight_put_credit_spread(account_id=account_id, **kwargs)
+            return _serialize(result)
+    except Exception as e:
+        logger.error("preflight_put_credit_spread failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Preflight Put Debit Spread",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def preflight_put_debit_spread(
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str = "DAY",
+    expiration_time: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Estimate costs for a Bear Put Spread (put debit spread) before placing it.
+
+    Buy a higher-strike put, sell a lower-strike put. Pays a net debit.
+    Does NOT place an order.
+
+    Args:
+        sell_contract_osi: OSI symbol of the put to sell (lower strike).
+        buy_contract_osi: OSI symbol of the put to buy (higher strike).
+        quantity: Number of spreads.
+        limit_price: Net debit to pay per spread (positive = debit paid).
+        time_in_force: DAY or GTD. Default is DAY.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        async with _get_client(account_id) as client:
+            result = await client.preflight_put_debit_spread(account_id=account_id, **kwargs)
+            return _serialize(result)
+    except Exception as e:
+        logger.error("preflight_put_debit_spread failed: %s", e, exc_info=True)
         return f"Error: {e}"
 
 
@@ -1046,6 +1359,489 @@ async def place_multileg_order(
                     f"Use get_order({order_id!r}) to check if the order was accepted."
                 ),
             },
+            indent=2,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Place Call Credit Spread",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def place_call_credit_spread(
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str = "DAY",
+    expiration_time: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Place a Bear Call Spread (call credit spread).
+
+    Sell a lower-strike call, buy a higher-strike call. Receives a net credit.
+    ⚠️ This executes a real trade. Consider running preflight_call_credit_spread first.
+
+    Args:
+        sell_contract_osi: OSI symbol of the call to sell (lower strike).
+        buy_contract_osi: OSI symbol of the call to buy (higher strike).
+        quantity: Number of spreads.
+        limit_price: Minimum net credit to receive per spread.
+        time_in_force: DAY or GTD. Default is DAY.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    order_id = str(uuid4())
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "order_id": order_id,
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        logger.info(
+            "Placing call credit spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
+            order_id, sell_contract_osi, buy_contract_osi, quantity, limit_price,
+        )
+        async with _get_client(account_id) as client:
+            new_order = await client.place_call_credit_spread(account_id=account_id, **kwargs)
+        logger.info("Call credit spread accepted: order_id=%s returned=%s", order_id, new_order.order_id)
+        return json.dumps(
+            {
+                "order_id": new_order.order_id,
+                "status": "submitted",
+                "message": "Order submitted. Use get_order to confirm status.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error("place_call_credit_spread failed (order_id=%s): %s", order_id, e, exc_info=True)
+        return json.dumps(
+            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
+            indent=2,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Place Call Debit Spread",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def place_call_debit_spread(
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str = "DAY",
+    expiration_time: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Place a Bull Call Spread (call debit spread).
+
+    Buy a lower-strike call, sell a higher-strike call. Pays a net debit.
+    ⚠️ This executes a real trade. Consider running preflight_call_debit_spread first.
+
+    Args:
+        sell_contract_osi: OSI symbol of the call to sell (higher strike).
+        buy_contract_osi: OSI symbol of the call to buy (lower strike).
+        quantity: Number of spreads.
+        limit_price: Maximum net debit to pay per spread.
+        time_in_force: DAY or GTD. Default is DAY.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    order_id = str(uuid4())
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "order_id": order_id,
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        logger.info(
+            "Placing call debit spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
+            order_id, sell_contract_osi, buy_contract_osi, quantity, limit_price,
+        )
+        async with _get_client(account_id) as client:
+            new_order = await client.place_call_debit_spread(account_id=account_id, **kwargs)
+        logger.info("Call debit spread accepted: order_id=%s returned=%s", order_id, new_order.order_id)
+        return json.dumps(
+            {
+                "order_id": new_order.order_id,
+                "status": "submitted",
+                "message": "Order submitted. Use get_order to confirm status.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error("place_call_debit_spread failed (order_id=%s): %s", order_id, e, exc_info=True)
+        return json.dumps(
+            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
+            indent=2,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Place Put Credit Spread",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def place_put_credit_spread(
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str = "DAY",
+    expiration_time: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Place a Bull Put Spread (put credit spread).
+
+    Sell a higher-strike put, buy a lower-strike put. Receives a net credit.
+    ⚠️ This executes a real trade. Consider running preflight_put_credit_spread first.
+
+    Args:
+        sell_contract_osi: OSI symbol of the put to sell (higher strike).
+        buy_contract_osi: OSI symbol of the put to buy (lower strike).
+        quantity: Number of spreads.
+        limit_price: Minimum net credit to receive per spread.
+        time_in_force: DAY or GTD. Default is DAY.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    order_id = str(uuid4())
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "order_id": order_id,
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        logger.info(
+            "Placing put credit spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
+            order_id, sell_contract_osi, buy_contract_osi, quantity, limit_price,
+        )
+        async with _get_client(account_id) as client:
+            new_order = await client.place_put_credit_spread(account_id=account_id, **kwargs)
+        logger.info("Put credit spread accepted: order_id=%s returned=%s", order_id, new_order.order_id)
+        return json.dumps(
+            {
+                "order_id": new_order.order_id,
+                "status": "submitted",
+                "message": "Order submitted. Use get_order to confirm status.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error("place_put_credit_spread failed (order_id=%s): %s", order_id, e, exc_info=True)
+        return json.dumps(
+            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
+            indent=2,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Place Put Debit Spread",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def place_put_debit_spread(
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str = "DAY",
+    expiration_time: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Place a Bear Put Spread (put debit spread).
+
+    Buy a higher-strike put, sell a lower-strike put. Pays a net debit.
+    ⚠️ This executes a real trade. Consider running preflight_put_debit_spread first.
+
+    Args:
+        sell_contract_osi: OSI symbol of the put to sell (lower strike).
+        buy_contract_osi: OSI symbol of the put to buy (higher strike).
+        quantity: Number of spreads.
+        limit_price: Maximum net debit to pay per spread.
+        time_in_force: DAY or GTD. Default is DAY.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    order_id = str(uuid4())
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "order_id": order_id,
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        logger.info(
+            "Placing put debit spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
+            order_id, sell_contract_osi, buy_contract_osi, quantity, limit_price,
+        )
+        async with _get_client(account_id) as client:
+            new_order = await client.place_put_debit_spread(account_id=account_id, **kwargs)
+        logger.info("Put debit spread accepted: order_id=%s returned=%s", order_id, new_order.order_id)
+        return json.dumps(
+            {
+                "order_id": new_order.order_id,
+                "status": "submitted",
+                "message": "Order submitted. Use get_order to confirm status.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error("place_put_debit_spread failed (order_id=%s): %s", order_id, e, exc_info=True)
+        return json.dumps(
+            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
+            indent=2,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Place Short Order",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def place_short_order(
+    symbol: str,
+    quantity: str,
+    order_type: str = "MARKET",
+    time_in_force: str = "DAY",
+    limit_price: Optional[str] = None,
+    stop_price: Optional[str] = None,
+    expiration_time: Optional[str] = None,
+    equity_market_session: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Place an equity short-sale order.
+
+    ⚠️ This executes a real trade. Consider running preflight_short_order first.
+
+    Args:
+        symbol: Ticker symbol to short (e.g. "AAPL").
+        quantity: Number of shares to short.
+        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT. Default is MARKET.
+        time_in_force: DAY or GTD. Default is DAY.
+        limit_price: Required for LIMIT and STOP_LIMIT orders.
+        stop_price: Required for STOP and STOP_LIMIT orders.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        equity_market_session: CORE or EXTENDED.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    order_id = str(uuid4())
+    try:
+        _validate_order_params(
+            quantity=quantity,
+            amount=None,
+            order_type=order_type,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            time_in_force=time_in_force,
+            expiration_time=expiration_time,
+        )
+        kwargs: dict[str, Any] = {
+            "symbol": symbol,
+            "quantity": Decimal(quantity),
+            "order_id": order_id,
+            "order_type": OrderType(order_type.upper()),
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if limit_price is not None:
+            kwargs["limit_price"] = Decimal(limit_price)
+        if stop_price is not None:
+            kwargs["stop_price"] = Decimal(stop_price)
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+        if equity_market_session:
+            kwargs["equity_market_session"] = EquityMarketSession(equity_market_session.upper())
+
+        logger.info(
+            "Placing short order: order_id=%s symbol=%s qty=%s type=%s",
+            order_id, symbol, quantity, order_type,
+        )
+        async with _get_client(account_id) as client:
+            new_order = await client.place_short_order(account_id=account_id, **kwargs)
+        logger.info("Short order accepted: order_id=%s returned=%s", order_id, new_order.order_id)
+        return json.dumps(
+            {
+                "order_id": new_order.order_id,
+                "status": "submitted",
+                "message": (
+                    "Short order submitted. Placement is asynchronous — "
+                    "use get_order to confirm status."
+                ),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error("place_short_order failed (order_id=%s): %s", order_id, e, exc_info=True)
+        return json.dumps(
+            {
+                "order_id": order_id,
+                "status": "error",
+                "message": f"Short order submission failed: {e}",
+            },
+            indent=2,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Flatten and Go Short",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def flatten_and_go_short(
+    symbol: str,
+    short_quantity: str,
+    order_type: str = "MARKET",
+    time_in_force: str = "DAY",
+    limit_price: Optional[str] = None,
+    stop_price: Optional[str] = None,
+    expiration_time: Optional[str] = None,
+    equity_market_session: Optional[str] = None,
+    flatten_timeout: float = 60.0,
+    account_id: Optional[str] = None,
+) -> str:
+    """
+    Sell any existing long position in a symbol, then place a short-sale order.
+
+    ⚠️ Experimental — this is a two-order workflow, not atomic. Market conditions
+    may change between the flatten fill and the short entry. Both orders execute
+    as real trades.
+
+    If no long position exists the flatten step is skipped and only the short
+    order is placed.
+
+    Args:
+        symbol: Ticker symbol (e.g. "AAPL").
+        short_quantity: Number of shares to short after flattening.
+        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT. Default is MARKET.
+        time_in_force: DAY or GTD. Default is DAY.
+        limit_price: Required for LIMIT and STOP_LIMIT orders.
+        stop_price: Required for STOP and STOP_LIMIT orders.
+        expiration_time: Required when time_in_force is GTD. ISO 8601 format.
+        equity_market_session: CORE or EXTENDED.
+        flatten_timeout: Seconds to wait for the flatten order to fill (default 60).
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    from datetime import datetime as dt
+
+    try:
+        _validate_order_params(
+            quantity=short_quantity,
+            amount=None,
+            order_type=order_type,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            time_in_force=time_in_force,
+            expiration_time=expiration_time,
+        )
+        kwargs: dict[str, Any] = {
+            "symbol": symbol,
+            "short_quantity": Decimal(short_quantity),
+            "order_type": OrderType(order_type.upper()),
+            "time_in_force": TimeInForce(time_in_force.upper()),
+            "flatten_timeout": flatten_timeout,
+        }
+        if limit_price is not None:
+            kwargs["limit_price"] = Decimal(limit_price)
+        if stop_price is not None:
+            kwargs["stop_price"] = Decimal(stop_price)
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+        if equity_market_session:
+            kwargs["equity_market_session"] = EquityMarketSession(equity_market_session.upper())
+
+        logger.info(
+            "Flatten-and-go-short: symbol=%s short_qty=%s type=%s",
+            symbol, short_quantity, order_type,
+        )
+        async with _get_client(account_id) as client:
+            result = await client.flatten_and_go_short(account_id=account_id, **kwargs)
+
+        flatten_order_id = result.flatten_order.order_id if result.flatten_order else None
+        logger.info(
+            "Flatten-and-go-short complete: symbol=%s flatten_order_id=%s short_order_id=%s",
+            symbol, flatten_order_id, result.short_order.order_id,
+        )
+        return json.dumps(
+            {
+                "short_order_id": result.short_order.order_id,
+                "flatten_order_id": flatten_order_id,
+                "initial_position_quantity": str(result.initial_position_quantity),
+                "status": "submitted",
+                "message": (
+                    "Short order submitted. Use get_order to confirm status. "
+                    "Note: this was a two-order workflow — verify both orders filled as expected."
+                ),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error("flatten_and_go_short failed (symbol=%s): %s", symbol, e, exc_info=True)
+        return json.dumps(
+            {"symbol": symbol, "status": "error", "message": f"Flatten-and-go-short failed: {e}"},
             indent=2,
         )
 
