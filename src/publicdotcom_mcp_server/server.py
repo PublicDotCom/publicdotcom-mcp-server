@@ -13,9 +13,10 @@ Requires:
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, AsyncGenerator, Optional
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
@@ -62,6 +63,13 @@ _api_key: ContextVar[str] = ContextVar("api_key", default="")
 _account_id: ContextVar[str] = ContextVar("account_id", default="")
 
 # ---------------------------------------------------------------------------
+# Client cache — one AsyncPublicApiClient per API secret so that access
+# tokens are reused across tool calls instead of being minted and discarded
+# on every request.
+# ---------------------------------------------------------------------------
+_clients: dict[str, AsyncPublicApiClient] = {}
+
+# ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
@@ -79,10 +87,17 @@ mcp = FastMCP(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_client(account_id: Optional[str] = None) -> AsyncPublicApiClient:
-    """Create an async SDK client.
+@asynccontextmanager
+async def _get_client(
+    account_id: Optional[str] = None,
+) -> AsyncGenerator[AsyncPublicApiClient, None]:
+    """Yield a cached SDK client for the current API key.
 
-    The API key is resolved in priority order:
+    Clients are cached per API secret so that access tokens are reused across
+    tool calls. The SDK's auth provider handles token refresh automatically
+    when the token approaches expiry — no extra round-trip on every request.
+
+    API key resolution order:
       1. Per-request Authorization header (HTTP transport)
       2. PUBLIC_COM_SECRET environment variable (stdio / fallback)
     """
@@ -93,13 +108,19 @@ def _get_client(account_id: Optional[str] = None) -> AsyncPublicApiClient:
             "or pass 'Authorization: Bearer <key>' in the request header. "
             "Get your key at https://public.com/settings/v2/api"
         )
-    acct = account_id or _account_id.get() or os.environ.get("PUBLIC_COM_ACCOUNT_ID")
-    return AsyncPublicApiClient(
-        auth_config=ApiKeyAuthConfig(api_secret_key=secret),
-        config=AsyncPublicApiClientConfiguration(
-            default_account_number=acct,
-        ),
-    )
+
+    if secret not in _clients:
+        acct = account_id or _account_id.get() or os.environ.get("PUBLIC_COM_ACCOUNT_ID")
+        _clients[secret] = AsyncPublicApiClient(
+            auth_config=ApiKeyAuthConfig(api_secret_key=secret),
+            config=AsyncPublicApiClientConfiguration(
+                default_account_number=acct,
+            ),
+        )
+
+    yield _clients[secret]
+    # Intentionally do not close — the client is cached and reused across
+    # requests so its auth provider can manage the token lifecycle.
 
 
 def _serialize(obj: Any) -> str:
