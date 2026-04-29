@@ -2060,14 +2060,14 @@ def main():
     """Run the MCP server.
 
     Transport is selected via the MCP_TRANSPORT environment variable:
-      - "streamable-http" (default) — for hosted/remote deployments
-      - "stdio"                     — for local Claude Desktop use
+      - "stdio"           (default) — for local Claude Desktop use
+      - "streamable-http"           — for hosted/remote deployments
 
     HTTP server binds to HOST (default 0.0.0.0) and PORT (default 8000).
     """
     import uvicorn
 
-    transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
 
     if transport == "stdio":
         mcp.run(transport="stdio")
