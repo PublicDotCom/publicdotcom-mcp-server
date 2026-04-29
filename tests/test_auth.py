@@ -15,61 +15,79 @@ import publicdotcom_mcp_server.server as srv
 # ---------------------------------------------------------------------------
 
 class TestGetClientAuthResolution:
-    def test_uses_contextvar_api_key_over_env(self, monkeypatch):
+    def setup_method(self):
+        # Each test gets a clean cache so patching AsyncPublicApiClient is effective.
+        srv._clients.clear()
+
+    async def test_uses_contextvar_api_key_over_env(self, monkeypatch):
         monkeypatch.setenv("PUBLIC_COM_SECRET", "env-key")
         token = srv._api_key.set("header-key")
         try:
             with patch("publicdotcom_mcp_server.server.AsyncPublicApiClient") as MockClient:
-                srv._get_client()
+                async with srv._get_client():
+                    pass
                 call_kwargs = MockClient.call_args.kwargs
                 assert call_kwargs["auth_config"].api_secret_key == "header-key"
         finally:
             srv._api_key.reset(token)
 
-    def test_falls_back_to_env_when_contextvar_empty(self, monkeypatch):
+    async def test_falls_back_to_env_when_contextvar_empty(self, monkeypatch):
         monkeypatch.setenv("PUBLIC_COM_SECRET", "env-key")
-        # ContextVar is empty by default
         with patch("publicdotcom_mcp_server.server.AsyncPublicApiClient") as MockClient:
-            srv._get_client()
+            async with srv._get_client():
+                pass
             call_kwargs = MockClient.call_args.kwargs
             assert call_kwargs["auth_config"].api_secret_key == "env-key"
 
-    def test_raises_when_no_key_available(self, monkeypatch):
+    async def test_raises_when_no_key_available(self, monkeypatch):
         monkeypatch.delenv("PUBLIC_COM_SECRET", raising=False)
-        # ContextVar is empty (default "")
         with pytest.raises(RuntimeError, match="No API key found"):
-            srv._get_client()
+            async with srv._get_client():
+                pass
 
-    def test_uses_contextvar_account_id_over_env(self, monkeypatch):
+    async def test_uses_contextvar_account_id_over_env(self, monkeypatch):
         monkeypatch.setenv("PUBLIC_COM_SECRET", "key")
         monkeypatch.setenv("PUBLIC_COM_ACCOUNT_ID", "env-account")
         token = srv._account_id.set("header-account")
         try:
             with patch("publicdotcom_mcp_server.server.AsyncPublicApiClient") as MockClient:
-                srv._get_client()
+                async with srv._get_client():
+                    pass
                 call_kwargs = MockClient.call_args.kwargs
                 assert call_kwargs["config"].default_account_number == "header-account"
         finally:
             srv._account_id.reset(token)
 
-    def test_falls_back_to_env_account_when_contextvar_empty(self, monkeypatch):
+    async def test_falls_back_to_env_account_when_contextvar_empty(self, monkeypatch):
         monkeypatch.setenv("PUBLIC_COM_SECRET", "key")
         monkeypatch.setenv("PUBLIC_COM_ACCOUNT_ID", "env-account")
         with patch("publicdotcom_mcp_server.server.AsyncPublicApiClient") as MockClient:
-            srv._get_client()
+            async with srv._get_client():
+                pass
             call_kwargs = MockClient.call_args.kwargs
             assert call_kwargs["config"].default_account_number == "env-account"
 
-    def test_explicit_account_id_arg_takes_priority(self, monkeypatch):
+    async def test_explicit_account_id_arg_takes_priority(self, monkeypatch):
         monkeypatch.setenv("PUBLIC_COM_SECRET", "key")
         ctx_token = srv._account_id.set("ctx-account")
         try:
             with patch("publicdotcom_mcp_server.server.AsyncPublicApiClient") as MockClient:
-                srv._get_client(account_id="arg-account")
+                async with srv._get_client(account_id="arg-account"):
+                    pass
                 call_kwargs = MockClient.call_args.kwargs
                 assert call_kwargs["config"].default_account_number == "arg-account"
         finally:
             srv._account_id.reset(ctx_token)
+
+    async def test_same_secret_reuses_cached_client(self, monkeypatch):
+        monkeypatch.setenv("PUBLIC_COM_SECRET", "same-key")
+        with patch("publicdotcom_mcp_server.server.AsyncPublicApiClient") as MockClient:
+            async with srv._get_client():
+                pass
+            async with srv._get_client():
+                pass
+            # Constructor called exactly once despite two _get_client() calls
+            assert MockClient.call_count == 1
 
 
 # ---------------------------------------------------------------------------
