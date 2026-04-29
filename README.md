@@ -25,9 +25,15 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_all_instruments` | List all available instruments with filters |
 | `get_option_expirations` | Available expiration dates for options |
 | `get_option_chain` | Full option chain (calls + puts) for a symbol |
-| `get_option_greeks` | Greeks (delta, gamma, theta, vega, rho, IV) |
+| `get_option_greeks` | Greeks (delta, gamma, theta, vega, rho, IV) for multiple options |
+| `get_option_greek` | Greeks for a single option symbol |
 | `preflight_order` | Estimate costs/impact before placing a single-leg order |
 | `preflight_multileg_order` | Estimate costs for multi-leg options strategies |
+| `preflight_short_order` | Estimate costs before placing a short-sale order |
+| `preflight_call_credit_spread` | Estimate costs for a Bear Call Spread |
+| `preflight_call_debit_spread` | Estimate costs for a Bull Call Spread |
+| `preflight_put_credit_spread` | Estimate costs for a Bull Put Spread |
+| `preflight_put_debit_spread` | Estimate costs for a Bear Put Spread |
 
 ### Write (Destructive)
 
@@ -35,6 +41,12 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 |------|-------------|
 | `place_order` | Place a single-leg order (stocks, crypto, options) |
 | `place_multileg_order` | Place multi-leg orders (spreads, straddles, etc.) |
+| `place_call_credit_spread` | Place a Bear Call Spread |
+| `place_call_debit_spread` | Place a Bull Call Spread |
+| `place_put_credit_spread` | Place a Bull Put Spread |
+| `place_put_debit_spread` | Place a Bear Put Spread |
+| `place_short_order` | Place an equity short-sale order |
+| `flatten_and_go_short` | Sell an existing long position then go short (experimental) |
 | `cancel_order` | Cancel an existing order |
 | `cancel_and_replace_order` | Atomically cancel and replace an order |
 
@@ -118,6 +130,20 @@ publicdotcom-mcp-server
 # Or run as a Python module
 python -m publicdotcom_mcp_server
 ```
+
+### Hosted / Remote Deployment
+
+For remote deployments (behind a reverse proxy or load balancer), switch to the streamable-HTTP transport:
+
+```bash
+export MCP_TRANSPORT=streamable-http
+export PUBLIC_COM_SECRET=your_api_secret_key
+export PORT=8000  # optional, defaults to 8000
+export HOST=0.0.0.0  # optional, defaults to 0.0.0.0
+publicdotcom-mcp-server
+```
+
+In this mode the server listens for MCP requests at `POST /mcp`. Clients authenticate per-request via an `Authorization: Bearer <key>` header, which takes priority over the `PUBLIC_COM_SECRET` environment variable — useful for multi-tenant deployments.
 
 ### Testing with MCP Inspector
 
