@@ -1141,7 +1141,7 @@ async def preflight_put_debit_spread(
     annotations={
         "title": "Place Order",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -1268,7 +1268,7 @@ async def place_order(
     annotations={
         "title": "Place Multi-Leg Order",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -1388,7 +1388,7 @@ async def place_multileg_order(
     annotations={
         "title": "Place Call Credit Spread",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -1459,7 +1459,7 @@ async def place_call_credit_spread(
     annotations={
         "title": "Place Call Debit Spread",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -1530,7 +1530,7 @@ async def place_call_debit_spread(
     annotations={
         "title": "Place Put Credit Spread",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -1601,7 +1601,7 @@ async def place_put_credit_spread(
     annotations={
         "title": "Place Put Debit Spread",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -1672,7 +1672,7 @@ async def place_put_debit_spread(
     annotations={
         "title": "Place Short Order",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
@@ -1767,7 +1767,7 @@ async def place_short_order(
     annotations={
         "title": "Flatten and Go Short",
         "readOnlyHint": False,
-        "destructiveHint": True,
+        "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
