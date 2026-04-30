@@ -31,3 +31,6 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 .coverage
+
+# Claude Code
+.claude/worktrees/
