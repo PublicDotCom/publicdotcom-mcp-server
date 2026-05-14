@@ -29,6 +29,8 @@ from public_api_sdk import (
     ApiKeyAuthConfig,
     AsyncPublicApiClient,
     AsyncPublicApiClientConfiguration,
+    BarAggregation,
+    BarPeriod,
     InstrumentType,
     OrderInstrument,
 )
@@ -423,8 +425,9 @@ async def get_quotes(
 
     Args:
         symbols: List of ticker symbols (e.g. ["AAPL", "GOOGL"]).
-        instrument_type: Type for all symbols — EQUITY, CRYPTO, or OPTION.
-            Default is EQUITY. For mixed types, call this tool multiple times.
+        instrument_type: Type for all symbols. One of EQUITY, CRYPTO, OPTION,
+            INDEX, ALT, BOND, TREASURY. Default is EQUITY. For mixed types,
+            call this tool multiple times.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
     try:
@@ -435,6 +438,80 @@ async def get_quotes(
             return _serialize(quotes)
     except Exception as e:
         logger.error("get_quotes failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Historic Bars",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_historic_bars(
+    symbol: str,
+    period: str,
+    instrument_type: str = "EQUITY",
+    aggregation: Optional[str] = None,
+    purchase_date: Optional[str] = None,
+) -> str:
+    """
+    Get OHLCV historic bar data for a symbol over a given time period.
+
+    Returns pre-market, regular-market, and after-hours bars plus the last
+    regular trading session close.
+
+    Args:
+        symbol: Ticker symbol. Format depends on instrument_type:
+            - EQUITY: e.g. "AAPL"
+            - CRYPTO: e.g. "BTC" (do not append "-USD")
+            - OPTION: OSI-normalized symbol, e.g. "AAPL260320C00280000"
+            - INDEX: e.g. "SPX"
+        period: Time window. One of DAY, WEEK, MONTH, QUARTER, HALF_YEAR,
+            YEAR, FIVE_YEARS, YTD, SINCE_PURCHASE.
+        instrument_type: EQUITY, CRYPTO, OPTION, or INDEX. Default EQUITY.
+        aggregation: Optional bar size. One of ONE_MINUTE, FIVE_MINUTES,
+            TEN_MINUTES, FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, ONE_DAY,
+            ONE_WEEK, ONE_MONTH, THREE_MONTHS, SIX_MONTHS, ONE_YEAR.
+            If omitted, the server picks an appropriate size for the period.
+        purchase_date: Required when period is SINCE_PURCHASE.
+            Format: YYYY-MM-DD.
+    """
+    try:
+        try:
+            period_enum = BarPeriod(period.upper())
+        except ValueError:
+            valid = [p.value for p in BarPeriod]
+            raise ValueError(f"Invalid period '{period}'. Valid: {valid}")
+
+        if period_enum == BarPeriod.SINCE_PURCHASE and not purchase_date:
+            raise ValueError(
+                "purchase_date (YYYY-MM-DD) is required when period is SINCE_PURCHASE"
+            )
+
+        kwargs: dict[str, Any] = {
+            "instrument_type": _parse_instrument_type(instrument_type),
+        }
+        if aggregation is not None:
+            try:
+                kwargs["aggregation"] = BarAggregation(aggregation.upper())
+            except ValueError:
+                valid = [a.value for a in BarAggregation]
+                raise ValueError(
+                    f"Invalid aggregation '{aggregation}'. Valid: {valid}"
+                )
+        if purchase_date is not None:
+            kwargs["purchase_date"] = purchase_date
+
+        async with _get_client() as client:
+            bars = await client.get_bars(symbol=symbol, period=period_enum, **kwargs)
+            return _serialize(bars)
+    except Exception as e:
+        logger.error(
+            "get_historic_bars failed (symbol=%s, period=%s, instrument_type=%s): %s",
+            symbol, period, instrument_type, e, exc_info=True,
+        )
         return f"Error: {e}"
 
 
@@ -455,7 +532,8 @@ async def get_instrument(symbol: str, instrument_type: str = "EQUITY") -> str:
 
     Args:
         symbol: Ticker symbol (e.g. "AAPL").
-        instrument_type: EQUITY, CRYPTO, OPTION, etc. Default is EQUITY.
+        instrument_type: One of EQUITY, CRYPTO, OPTION, INDEX, ALT, BOND,
+            TREASURY. Default is EQUITY.
     """
     try:
         itype = _parse_instrument_type(instrument_type)

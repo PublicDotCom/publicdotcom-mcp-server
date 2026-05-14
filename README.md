@@ -21,6 +21,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_order` | Get status of a specific order |
 | `get_history` | Transaction history (trades, deposits, dividends, etc.) |
 | `get_quotes` | Real-time quotes for stocks, crypto, options |
+| `get_historic_bars` | OHLCV historic bars for equities, crypto, options, or indices |
 | `get_instrument` | Details about a specific tradeable instrument |
 | `get_all_instruments` | List all available instruments with filters |
 | `get_option_expirations` | Available expiration dates for options |
