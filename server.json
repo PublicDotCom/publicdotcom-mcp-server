@@ -3,12 +3,12 @@
   "name": "io.github.publicdotcom/publicdotcom-mcp-server",
   "title": "Public.com Trading API",
   "description": "Connect AI assistants to your Public.com brokerage account. Trade stocks, options, and crypto — get quotes, manage orders, and view your portfolio.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "pip",
       "identifier": "publicdotcom-mcp-server",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "transport": {
         "type": "stdio"
       },
