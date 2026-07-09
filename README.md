@@ -170,9 +170,9 @@ python -m publicdotcom_mcp_server
 ### CI & Releases
 
 - **CI** (`.github/workflows/ci.yml`) runs the test suite (Python 3.10–3.13) and `ruff` on every push to `main` and every pull request.
-- **Releases** (`.github/workflows/release.yml`) build and publish to PyPI when a GitHub Release is published, using [PyPI Trusted Publishing (OIDC)](https://docs.pypi.org/trusted-publishers/) — no API token is stored.
+- **Releases** (`.github/workflows/release.yml`) run on every push to `main`. When the `version` in `pyproject.toml` is one that hasn't been released yet (no matching `v<version>` tag), the workflow builds the package, publishes to PyPI via [Trusted Publishing (OIDC)](https://docs.pypi.org/trusted-publishers/) — no API token is stored — and creates the corresponding GitHub Release. Merges that don't change the version are no-ops.
 
-To cut a release: bump `version` in `pyproject.toml`, then publish a GitHub Release. One-time setup on PyPI (project → **Publishing**) must register a Trusted Publisher for this repo with workflow `release.yml` and environment `pypi`.
+**To cut a release:** bump `version` in `pyproject.toml` in your PR and merge it to `main`. The release + PyPI publish + `v<version>` tag/GitHub Release happen automatically. One-time setup on PyPI (project → **Publishing**) must register a Trusted Publisher for this repo with workflow `release.yml` and environment `pypi`.
 
 ## How It Works
 

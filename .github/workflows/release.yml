@@ -1,28 +1,67 @@
 name: release
 
+# Runs on every push to main (i.e. every merged PR). It only cuts a release
+# when pyproject.toml's version is one that hasn't been released yet (no
+# matching v<version> git tag). Merges that don't bump the version are no-ops,
+# which is required because PyPI permanently rejects re-uploading a version.
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
-    # Scopes the PyPI Trusted Publisher to this environment and enables
-    # optional approval gating (configure under Settings > Environments).
     environment: pypi
     permissions:
-      # Required for PyPI Trusted Publishing (OIDC) — lets the job mint a
-      # short-lived identity token instead of using a stored API token.
-      id-token: write
-      contents: read
+      id-token: write   # PyPI Trusted Publishing (OIDC)
+      contents: write   # create the git tag + GitHub Release
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full tag history to detect existing releases
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Read version from pyproject.toml
+        id: ver
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this version was already released
+        id: check
+        run: |
+          if git rev-parse "refs/tags/v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::v${{ steps.ver.outputs.version }} already tagged — skipping release."
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Releasing v${{ steps.ver.outputs.version }}."
+          fi
+
       - name: Build sdist and wheel
+        if: success() && steps.check.outputs.new == 'true'
         run: |
           python -m pip install --upgrade pip build
           python -m build
+
       - name: Publish to PyPI
+        if: success() && steps.check.outputs.new == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Create GitHub Release
+        if: success() && steps.check.outputs.new == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: dist/*
