@@ -21,7 +21,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_order` | Get status of a specific order |
 | `get_history` | Transaction history (trades, deposits, dividends, etc.) |
 | `get_quotes` | Real-time quotes for stocks, crypto, options |
-| `get_historic_bars` | OHLCV historic bars for equities, crypto, options, or indices |
+| `get_price_history` | OHLCV price history for equities, crypto, options, or indices |
 | `get_instrument` | Details about a specific tradeable instrument |
 | `get_all_instruments` | List all available instruments with filters |
 | `get_option_expirations` | Available expiration dates for options |
@@ -167,6 +167,13 @@ pytest
 python -m publicdotcom_mcp_server
 ```
 
+### CI & Releases
+
+- **CI** (`.github/workflows/ci.yml`) runs the test suite (Python 3.10–3.13) and `ruff` on every push to `main` and every pull request.
+- **Releases** (`.github/workflows/release.yml`) build and publish to PyPI when a GitHub Release is published, using [PyPI Trusted Publishing (OIDC)](https://docs.pypi.org/trusted-publishers/) — no API token is stored.
+
+To cut a release: bump `version` in `pyproject.toml`, then publish a GitHub Release. One-time setup on PyPI (project → **Publishing**) must register a Trusted Publisher for this repo with workflow `release.yml` and environment `pypi`.
+
 ## How It Works
 
 This server wraps the [`publicdotcom-py`](https://pypi.org/project/publicdotcom-py/) Python SDK, exposing each API operation as an MCP tool. The MCP protocol allows AI clients to discover and call these tools through a standardized interface.
@@ -181,7 +188,8 @@ Public.com Trading API
 
 All tools include proper [MCP tool annotations](https://modelcontextprotocol.io/docs/concepts/tools#tool-annotations):
 - Read-only tools are marked with `readOnlyHint: true`
-- Write tools are marked with `destructiveHint: true`
+- Order-placement tools are marked with `readOnlyHint: false` (they modify account state)
+- Order cancellation tools (`cancel_order`, `cancel_and_replace_order`) are additionally marked with `destructiveHint: true`
 
 ## License
 

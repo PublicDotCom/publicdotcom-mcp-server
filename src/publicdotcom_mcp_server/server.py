@@ -13,14 +13,14 @@ Requires:
 import json
 import logging
 import os
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from decimal import Decimal
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, Literal
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
-from starlette.middleware.base import BaseHTTPMiddleware
 
 # ---------------------------------------------------------------------------
 # SDK import — installed via `pip install publicdotcom-py`
@@ -36,6 +36,7 @@ from public_api_sdk import (
 )
 from public_api_sdk.models import (
     CancelAndReplaceRequest,
+    EquityMarketSession,
     HistoryRequest,
     InstrumentsRequest,
     LegInstrument,
@@ -53,8 +54,10 @@ from public_api_sdk.models import (
     PreflightRequest,
     TimeInForce,
     Trading,
-    EquityMarketSession,
+    TradingSessionToggle,
 )
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +94,7 @@ mcp = FastMCP(
 
 @asynccontextmanager
 async def _get_client(
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> AsyncGenerator[AsyncPublicApiClient, None]:
     """Yield a cached SDK client for the current API key.
 
@@ -162,20 +165,56 @@ def _parse_instrument_type(type_str: str) -> InstrumentType:
         valid = [t.value for t in InstrumentType]
         raise ValueError(
             f"Invalid instrument type '{type_str}'. Valid types: {valid}"
+        ) from None
+
+
+class OrderLeg(BaseModel):
+    """One leg of a multi-leg options/equity order."""
+
+    symbol: str = Field(
+        description=(
+            "Option OCC symbol (e.g. 'SPY260313P00670000') for options, or "
+            "ticker (e.g. 'AAPL') for equity."
         )
+    )
+    type: Literal["EQUITY", "OPTION"] = Field(description="Instrument type.")
+    side: Literal["BUY", "SELL"] = Field(description="Order side.")
+    open_close_indicator: Literal["OPEN", "CLOSE"] | None = Field(
+        default=None,
+        description="OPEN for new positions, CLOSE to close existing. Required for option legs.",
+    )
+    ratio_quantity: int = Field(
+        default=1,
+        description="Ratio between legs in the spread (default 1).",
+    )
+
+
+def _build_leg_request(leg: OrderLeg) -> OrderLegRequest:
+    leg_kwargs: dict[str, Any] = {
+        "instrument": LegInstrument(
+            symbol=leg.symbol,
+            type=LegInstrumentType(leg.type),
+        ),
+        "side": OrderSide(leg.side),
+    }
+    if leg.open_close_indicator:
+        leg_kwargs["open_close_indicator"] = OpenCloseIndicator(leg.open_close_indicator)
+    if leg.ratio_quantity:
+        leg_kwargs["ratio_quantity"] = leg.ratio_quantity
+    return OrderLegRequest(**leg_kwargs)
 
 
 def _validate_order_params(
     *,
-    quantity: Optional[str],
-    amount: Optional[str],
+    quantity: str | None,
+    amount: str | None,
     order_type: str,
-    limit_price: Optional[str],
-    stop_price: Optional[str],
-    instrument_type: Optional[str] = None,
-    open_close_indicator: Optional[str] = None,
-    time_in_force: Optional[str] = None,
-    expiration_time: Optional[str] = None,
+    limit_price: str | None,
+    stop_price: str | None,
+    instrument_type: str | None = None,
+    open_close_indicator: str | None = None,
+    time_in_force: str | None = None,
+    expiration_time: str | None = None,
 ) -> None:
     """Validate order parameters and raise ValueError with a clear message on violation."""
     if quantity is not None and amount is not None:
@@ -198,7 +237,7 @@ def _validate_order_params(
             try:
                 Decimal(raw_value)
             except Exception:
-                raise ValueError(f"{field_name} must be a numeric string, got: {raw_value!r}")
+                raise ValueError(f"{field_name} must be a numeric string, got: {raw_value!r}") from None
 
 
 # ========================================================================
@@ -238,7 +277,7 @@ async def check_setup() -> str:
             default = os.environ.get("PUBLIC_COM_ACCOUNT_ID", "(not set)")
             return (
                 "✅ Authenticated successfully.\n"
-                f"Accounts found:\n" + "\n".join(acct_list) + "\n"
+                "Accounts found:\n" + "\n".join(acct_list) + "\n"
                 f"Default account ID: {default}"
             )
     except Exception as e:
@@ -276,7 +315,7 @@ async def get_accounts() -> str:
         "openWorldHint": True,
     },
 )
-async def get_portfolio(account_id: Optional[str] = None) -> str:
+async def get_portfolio(account_id: str | None = None) -> str:
     """
     Get a snapshot of the account portfolio.
 
@@ -303,7 +342,7 @@ async def get_portfolio(account_id: Optional[str] = None) -> str:
         "openWorldHint": True,
     },
 )
-async def get_orders(account_id: Optional[str] = None) -> str:
+async def get_orders(account_id: str | None = None) -> str:
     """
     Get all open/active orders on the account.
 
@@ -332,7 +371,7 @@ async def get_orders(account_id: Optional[str] = None) -> str:
         "openWorldHint": True,
     },
 )
-async def get_order(order_id: str, account_id: Optional[str] = None) -> str:
+async def get_order(order_id: str, account_id: str | None = None) -> str:
     """
     Get the status and details of a specific order.
 
@@ -361,11 +400,11 @@ async def get_order(order_id: str, account_id: Optional[str] = None) -> str:
     },
 )
 async def get_history(
-    account_id: Optional[str] = None,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    page_size: Optional[int] = None,
-    next_token: Optional[str] = None,
+    account_id: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    page_size: int | None = None,
+    next_token: str | None = None,
 ) -> str:
     """
     Retrieve account transaction history.
@@ -416,7 +455,7 @@ async def get_history(
 async def get_quotes(
     symbols: list[str],
     instrument_type: str = "EQUITY",
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get real-time quotes for one or more symbols.
@@ -441,77 +480,117 @@ async def get_quotes(
         return f"Error: {e}"
 
 
+# Valid aggregations per period for get_price_history, verified empirically
+# against the historicdata endpoint. Each period accepts a contiguous window of
+# bar sizes; finer or coarser sizes outside the window are rejected by the
+# server with HTTP 400. Omit aggregation to let the server pick a default.
+_ALL_AGGREGATIONS: frozenset[str] = frozenset(
+    {
+        "ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES",
+        "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH",
+        "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR",
+    }
+)
+_VALID_AGGREGATIONS: dict[str, frozenset[str]] = {
+    "DAY": frozenset(
+        {"ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR"}
+    ),
+    "WEEK": frozenset(
+        {"FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY"}
+    ),
+    "MONTH": frozenset({"ONE_HOUR", "ONE_DAY", "ONE_WEEK"}),
+    "QUARTER": frozenset({"ONE_DAY", "ONE_WEEK", "ONE_MONTH"}),
+    "HALF_YEAR": frozenset({"ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS"}),
+    "YEAR": frozenset({"ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS"}),
+    "FIVE_YEARS": frozenset(
+        {"ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"}
+    ),
+    "TEN_YEARS": frozenset({"ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"}),
+    "ALL": frozenset({"ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"}),
+    "YTD": frozenset({"ONE_DAY", "ONE_WEEK", "ONE_MONTH"}),
+    # SINCE_PURCHASE spans an arbitrary duration (days to years depending on the
+    # purchase date), so no fixed bar-size window applies. Accept any size and
+    # let the server reject combinations that don't fit the actual span.
+    "SINCE_PURCHASE": _ALL_AGGREGATIONS,
+}
+
+
 @mcp.tool(
     annotations={
-        "title": "Get Historic Bars",
+        "title": "Get Price History",
         "readOnlyHint": True,
         "destructiveHint": False,
         "openWorldHint": True,
     },
 )
-async def get_historic_bars(
+async def get_price_history(
     symbol: str,
-    period: str,
-    instrument_type: str = "EQUITY",
-    aggregation: Optional[str] = None,
-    purchase_date: Optional[str] = None,
+    period: Literal[
+        "DAY", "WEEK", "MONTH", "QUARTER", "HALF_YEAR", "YEAR",
+        "FIVE_YEARS", "TEN_YEARS", "ALL", "YTD", "SINCE_PURCHASE",
+    ],
+    instrument_type: Literal["EQUITY", "CRYPTO", "OPTION", "INDEX"] = "EQUITY",
+    aggregation: Literal["ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"] | None = None,
+    purchase_date: str | None = None,
+    trading_session_toggle: Literal["REGULAR_HOURS", "REGULAR_AND_EXTENDED_HOURS", "ALL_SESSIONS"] | None = None,
 ) -> str:
     """
-    Get OHLCV historic bar data for a symbol over a given time period.
+    Get historical OHLCV price bars for a symbol over a time period.
 
-    Returns pre-market, regular-market, and after-hours bars plus the last
-    regular trading session close.
+    Returns open/high/low/close/volume bars split into pre-market, regular,
+    and after-hours sessions, plus previous close and total gain/loss. Use
+    this for trend analysis and historical prices — get_quotes returns the
+    current price only, and get_history is account activity, not prices.
 
     Args:
-        symbol: Ticker symbol. Format depends on instrument_type:
-            - EQUITY: e.g. "AAPL"
-            - CRYPTO: e.g. "BTC" (do not append "-USD")
-            - OPTION: OSI-normalized symbol, e.g. "AAPL260320C00280000"
-            - INDEX: e.g. "SPX"
-        period: Time window. One of DAY, WEEK, MONTH, QUARTER, HALF_YEAR,
-            YEAR, FIVE_YEARS, YTD, SINCE_PURCHASE.
+        symbol: Ticker symbol (e.g. "AAPL").
+        period: Time window to retrieve (e.g. "YEAR", "TEN_YEARS", "ALL").
         instrument_type: EQUITY, CRYPTO, OPTION, or INDEX. Default EQUITY.
-        aggregation: Optional bar size. One of ONE_MINUTE, FIVE_MINUTES,
-            TEN_MINUTES, FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, ONE_DAY,
-            ONE_WEEK, ONE_MONTH, THREE_MONTHS, SIX_MONTHS, ONE_YEAR.
-            If omitted, the server picks an appropriate size for the period.
-        purchase_date: Required when period is SINCE_PURCHASE.
-            Format: YYYY-MM-DD.
+        aggregation: Optional bar size. Prefer omitting it — the server then
+            picks an appropriate size for the period. Only a subset of sizes
+            is valid per period (finer/coarser sizes are rejected); if you set
+            an invalid one, the error lists the valid options.
+        purchase_date: Required only when period is "SINCE_PURCHASE".
+            Format "YYYY-MM-DD".
+        trading_session_toggle: Which sessions to include on the DAY equity
+            chart. Omit for the default (REGULAR_AND_EXTENDED_HOURS,
+            04:00–20:00 ET). REGULAR_HOURS limits to 09:30–16:00. ALL_SESSIONS
+            returns a full midnight-to-midnight chart including the overnight
+            ATS sessions, adding preMarketOvernight (00:00–04:00) and
+            postMarketOvernight (20:00–24:00) to the response.
     """
-    try:
-        try:
-            period_enum = BarPeriod(period.upper())
-        except ValueError:
-            valid = [p.value for p in BarPeriod]
-            raise ValueError(f"Invalid period '{period}'. Valid: {valid}")
-
-        if period_enum == BarPeriod.SINCE_PURCHASE and not purchase_date:
-            raise ValueError(
-                "purchase_date (YYYY-MM-DD) is required when period is SINCE_PURCHASE"
-            )
-
-        kwargs: dict[str, Any] = {
-            "instrument_type": _parse_instrument_type(instrument_type),
-        }
-        if aggregation is not None:
-            try:
-                kwargs["aggregation"] = BarAggregation(aggregation.upper())
-            except ValueError:
-                valid = [a.value for a in BarAggregation]
-                raise ValueError(
-                    f"Invalid aggregation '{aggregation}'. Valid: {valid}"
+    if period == "SINCE_PURCHASE" and not purchase_date:
+        return json.dumps(
+            {"error": "purchase_date (YYYY-MM-DD) is required when period is SINCE_PURCHASE."}
+        )
+    allowed = _VALID_AGGREGATIONS.get(period)
+    if aggregation and allowed is not None and aggregation not in allowed:
+        return json.dumps(
+            {
+                "error": (
+                    f"aggregation '{aggregation}' is not valid for period '{period}'. "
+                    f"Valid: {sorted(allowed)}. Or omit aggregation to let the "
+                    f"server choose an appropriate size."
                 )
-        if purchase_date is not None:
-            kwargs["purchase_date"] = purchase_date
-
+            }
+        )
+    try:
         async with _get_client() as client:
-            bars = await client.get_bars(symbol=symbol, period=period_enum, **kwargs)
+            bars = await client.get_bars(
+                symbol=symbol,
+                period=BarPeriod(period),
+                instrument_type=_parse_instrument_type(instrument_type),
+                aggregation=BarAggregation(aggregation) if aggregation else None,
+                purchase_date=purchase_date,
+                trading_session_toggle=(
+                    TradingSessionToggle(trading_session_toggle)
+                    if trading_session_toggle
+                    else None
+                ),
+            )
             return _serialize(bars)
     except Exception as e:
-        logger.error(
-            "get_historic_bars failed (symbol=%s, period=%s, instrument_type=%s): %s",
-            symbol, period, instrument_type, e, exc_info=True,
-        )
+        logger.error("get_price_history failed (symbol=%s): %s", symbol, e, exc_info=True)
         return f"Error: {e}"
 
 
@@ -556,9 +635,9 @@ async def get_instrument(symbol: str, instrument_type: str = "EQUITY") -> str:
     },
 )
 async def get_all_instruments(
-    type_filter: Optional[list[str]] = None,
-    trading_filter: Optional[list[str]] = None,
-    account_id: Optional[str] = None,
+    type_filter: list[str] | None = None,
+    trading_filter: list[str] | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     List all available tradeable instruments with optional filters.
@@ -604,7 +683,7 @@ async def get_all_instruments(
 async def get_option_expirations(
     symbol: str,
     instrument_type: str = "EQUITY",
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get available option expiration dates for a symbol.
@@ -641,7 +720,7 @@ async def get_option_chain(
     symbol: str,
     expiration_date: str,
     instrument_type: str = "EQUITY",
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get the full option chain (calls and puts) for a symbol and expiration.
@@ -678,7 +757,7 @@ async def get_option_chain(
 )
 async def get_option_greeks(
     osi_symbols: list[str],
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get option Greeks (delta, gamma, theta, vega, rho, IV) for option symbols.
@@ -709,7 +788,7 @@ async def get_option_greeks(
 )
 async def get_option_greek(
     osi_symbol: str,
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get option Greeks (delta, gamma, theta, vega, rho, IV) for a single option symbol.
@@ -748,14 +827,14 @@ async def preflight_order(
     order_side: str,
     order_type: str,
     time_in_force: str = "DAY",
-    quantity: Optional[str] = None,
-    amount: Optional[str] = None,
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    open_close_indicator: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
-    account_id: Optional[str] = None,
+    quantity: str | None = None,
+    amount: str | None = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    open_close_indicator: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs and impact of a potential single-leg trade before placing it.
@@ -842,12 +921,12 @@ async def preflight_order(
     },
 )
 async def preflight_multileg_order(
-    legs: list[dict],
+    legs: list[OrderLeg],
     limit_price: str,
     time_in_force: str = "DAY",
-    quantity: Optional[int] = None,
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    quantity: int | None = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a multi-leg (options strategy) trade before placing it.
@@ -879,33 +958,17 @@ async def preflight_multileg_order(
         try:
             Decimal(limit_price)
         except Exception:
-            raise ValueError(f"limit_price must be a numeric string, got: {limit_price!r}")
+            raise ValueError(f"limit_price must be a numeric string, got: {limit_price!r}") from None
 
         exp_kwargs: dict[str, Any] = {"time_in_force": TimeInForce(time_in_force.upper())}
         if expiration_time:
             exp_kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
 
-        leg_requests = []
-        for leg in legs:
-            # Support both flat format {"symbol": ..., "type": ...} and
-            # nested format {"instrument": {"symbol": ..., "type": ...}, ...}
-            instrument = leg.get("instrument") or {}
-            symbol = instrument.get("symbol") or leg["symbol"]
-            inst_type = instrument.get("type") or leg["type"]
-            leg_kwargs: dict[str, Any] = {
-                "instrument": LegInstrument(
-                    symbol=symbol,
-                    type=LegInstrumentType(inst_type.upper()),
-                ),
-                "side": OrderSide(leg["side"].upper()),
-            }
-            if leg.get("open_close_indicator"):
-                leg_kwargs["open_close_indicator"] = OpenCloseIndicator(
-                    leg["open_close_indicator"].upper()
-                )
-            if leg.get("ratio_quantity"):
-                leg_kwargs["ratio_quantity"] = leg["ratio_quantity"]
-            leg_requests.append(OrderLegRequest(**leg_kwargs))
+        # `legs` is list[OrderLeg] when invoked via MCP/Pydantic; when invoked
+        # directly in tests it may be list[dict]. model_validate handles both.
+        leg_requests = [
+            _build_leg_request(OrderLeg.model_validate(leg)) for leg in legs
+        ]
 
         req_kwargs: dict[str, Any] = {
             "order_type": OrderType.LIMIT,
@@ -940,11 +1003,11 @@ async def preflight_short_order(
     quantity: str,
     order_type: str = "MARKET",
     time_in_force: str = "DAY",
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
-    account_id: Optional[str] = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a short-sale equity order before placing it.
@@ -1012,8 +1075,8 @@ async def preflight_call_credit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a Bear Call Spread (call credit spread) before placing it.
@@ -1065,8 +1128,8 @@ async def preflight_call_debit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a Bull Call Spread (call debit spread) before placing it.
@@ -1118,8 +1181,8 @@ async def preflight_put_credit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a Bull Put Spread (put credit spread) before placing it.
@@ -1171,8 +1234,8 @@ async def preflight_put_debit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a Bear Put Spread (put debit spread) before placing it.
@@ -1230,14 +1293,14 @@ async def place_order(
     order_side: str,
     order_type: str,
     time_in_force: str = "DAY",
-    quantity: Optional[str] = None,
-    amount: Optional[str] = None,
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    open_close_indicator: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
-    account_id: Optional[str] = None,
+    quantity: str | None = None,
+    amount: str | None = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    open_close_indicator: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a single-leg order (buy/sell stocks, crypto, or options).
@@ -1352,12 +1415,12 @@ async def place_order(
     },
 )
 async def place_multileg_order(
-    legs: list[dict],
+    legs: list[OrderLeg],
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a multi-leg order (options strategies: spreads, straddles, etc.).
@@ -1391,33 +1454,17 @@ async def place_multileg_order(
         try:
             Decimal(limit_price)
         except Exception:
-            raise ValueError(f"limit_price must be a numeric string, got: {limit_price!r}")
+            raise ValueError(f"limit_price must be a numeric string, got: {limit_price!r}") from None
 
         exp_kwargs: dict[str, Any] = {"time_in_force": TimeInForce(time_in_force.upper())}
         if expiration_time:
             exp_kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
 
-        leg_requests = []
-        for leg in legs:
-            # Support both flat format {"symbol": ..., "type": ...} and
-            # nested format {"instrument": {"symbol": ..., "type": ...}, ...}
-            instrument = leg.get("instrument") or {}
-            symbol = instrument.get("symbol") or leg["symbol"]
-            inst_type = instrument.get("type") or leg["type"]
-            leg_kwargs: dict[str, Any] = {
-                "instrument": LegInstrument(
-                    symbol=symbol,
-                    type=LegInstrumentType(inst_type.upper()),
-                ),
-                "side": OrderSide(leg["side"].upper()),
-            }
-            if leg.get("open_close_indicator"):
-                leg_kwargs["open_close_indicator"] = OpenCloseIndicator(
-                    leg["open_close_indicator"].upper()
-                )
-            if leg.get("ratio_quantity"):
-                leg_kwargs["ratio_quantity"] = leg["ratio_quantity"]
-            leg_requests.append(OrderLegRequest(**leg_kwargs))
+        # `legs` is list[OrderLeg] when invoked via MCP/Pydantic; when invoked
+        # directly in tests it may be list[dict]. model_validate handles both.
+        leg_requests = [
+            _build_leg_request(OrderLeg.model_validate(leg)) for leg in legs
+        ]
 
         req = MultilegOrderRequest(
             order_id=order_id,
@@ -1477,8 +1524,8 @@ async def place_call_credit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a Bear Call Spread (call credit spread).
@@ -1548,8 +1595,8 @@ async def place_call_debit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a Bull Call Spread (call debit spread).
@@ -1619,8 +1666,8 @@ async def place_put_credit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a Bull Put Spread (put credit spread).
@@ -1690,8 +1737,8 @@ async def place_put_debit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a Bear Put Spread (put debit spread).
@@ -1760,11 +1807,11 @@ async def place_short_order(
     quantity: str,
     order_type: str = "MARKET",
     time_in_force: str = "DAY",
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
-    account_id: Optional[str] = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place an equity short-sale order.
@@ -1855,12 +1902,12 @@ async def flatten_and_go_short(
     short_quantity: str,
     order_type: str = "MARKET",
     time_in_force: str = "DAY",
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
     flatten_timeout: float = 60.0,
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Sell any existing long position in a symbol, then place a short-sale order.
@@ -1956,7 +2003,7 @@ async def flatten_and_go_short(
 )
 async def cancel_order(
     order_id: str,
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Cancel an existing order.
@@ -2002,11 +2049,11 @@ async def cancel_and_replace_order(
     order_id: str,
     order_type: str,
     time_in_force: str = "DAY",
-    quantity: Optional[str] = None,
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    quantity: str | None = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Atomically cancel an existing order and replace it with new parameters.

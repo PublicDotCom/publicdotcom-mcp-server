@@ -34,3 +34,6 @@ htmlcov/
 
 # Claude Code
 .claude/worktrees/
+
+# Local source-of-truth reference (not part of the package)
+hosted_server.py

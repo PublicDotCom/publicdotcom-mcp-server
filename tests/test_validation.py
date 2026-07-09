@@ -3,7 +3,6 @@ Parametrized tests confirming place_order and preflight_order share
 identical validation behaviour via _validate_order_params().
 """
 import json
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

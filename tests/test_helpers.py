@@ -3,8 +3,11 @@ import json
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from publicdotcom_mcp_server.server import (
+    OrderLeg,
+    _build_leg_request,
     _parse_instrument_type,
     _serialize,
     _validate_order_params,
@@ -204,3 +207,56 @@ class TestSerialize:
         result = _serialize({"key": "value"})
         data = json.loads(result)
         assert data["key"] == "value"
+
+
+class TestOrderLeg:
+    def test_ratio_quantity_defaults_to_one(self):
+        leg = OrderLeg(symbol="AAPL260320C00280000", type="OPTION", side="BUY")
+        assert leg.ratio_quantity == 1
+        assert leg.open_close_indicator is None
+
+    def test_model_validate_accepts_dict(self):
+        leg = OrderLeg.model_validate(
+            {
+                "symbol": "AAPL260320C00280000",
+                "type": "OPTION",
+                "side": "SELL",
+                "open_close_indicator": "OPEN",
+                "ratio_quantity": 2,
+            }
+        )
+        assert leg.side == "SELL"
+        assert leg.open_close_indicator == "OPEN"
+        assert leg.ratio_quantity == 2
+
+    def test_invalid_side_rejected(self):
+        with pytest.raises(ValidationError):
+            OrderLeg(symbol="AAPL", type="EQUITY", side="HOLD")
+
+
+class TestBuildLegRequest:
+    def test_builds_option_leg_with_open_close(self):
+        from public_api_sdk.models import (
+            LegInstrumentType,
+            OpenCloseIndicator,
+            OrderSide,
+        )
+
+        leg = OrderLeg(
+            symbol="AAPL260320C00280000",
+            type="OPTION",
+            side="BUY",
+            open_close_indicator="OPEN",
+            ratio_quantity=3,
+        )
+        req = _build_leg_request(leg)
+        assert req.instrument.symbol == "AAPL260320C00280000"
+        assert req.instrument.type == LegInstrumentType.OPTION
+        assert req.side == OrderSide.BUY
+        assert req.open_close_indicator == OpenCloseIndicator.OPEN
+        assert req.ratio_quantity == 3
+
+    def test_equity_leg_omits_open_close_indicator(self):
+        leg = OrderLeg(symbol="AAPL", type="EQUITY", side="SELL")
+        req = _build_leg_request(leg)
+        assert req.open_close_indicator is None
