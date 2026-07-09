@@ -10,6 +10,7 @@ from publicdotcom_mcp_server.server import (
     mcp,
     place_multileg_order,
     place_order,
+    preflight_multileg_order,
 )
 
 
@@ -42,9 +43,11 @@ class TestToolAnnotations:
         tool = _get_tool("place_order")
         assert tool.annotations.openWorldHint is True
 
-    def test_place_order_destructive_hint_is_true(self):
+    def test_place_order_destructive_hint_is_false(self):
+        # Placing an order adds state rather than destroying it, so it is not
+        # marked destructive (matches the hosted server's annotations).
         tool = _get_tool("place_order")
-        assert tool.annotations.destructiveHint is True
+        assert tool.annotations.destructiveHint is False
 
     def test_read_only_tools_open_world_hint_is_true(self):
         for name in [
@@ -219,6 +222,50 @@ class TestPlaceMultilegOrder:
         id1 = json.loads(result1)["order_id"]
         id2 = json.loads(result2)["order_id"]
         assert id1 != id2
+
+
+class TestPreflightMultilegOrder:
+    SAMPLE_LEGS = [
+        {"symbol": "AAPL260320C00280000", "type": "OPTION", "side": "BUY", "open_close_indicator": "OPEN"},
+        {"symbol": "AAPL260320C00290000", "type": "OPTION", "side": "SELL", "open_close_indicator": "OPEN"},
+    ]
+
+    async def test_successful_preflight_builds_typed_legs(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_result = MagicMock()
+        mock_result.model_dump.return_value = {"estimated_cost": "150.00"}
+        mock_client.perform_multi_leg_preflight_calculation = AsyncMock(
+            return_value=mock_result
+        )
+
+        result = await preflight_multileg_order(
+            legs=self.SAMPLE_LEGS,
+            limit_price="1.50",
+            quantity=1,
+        )
+        assert "estimated_cost" in result
+        # dict legs are coerced through the typed OrderLeg model into the request
+        req = mock_client.perform_multi_leg_preflight_calculation.await_args.kwargs[
+            "preflight_request"
+        ]
+        assert len(req.legs) == 2
+
+    async def test_non_numeric_limit_price_returns_error(self, patch_get_client):
+        result = await preflight_multileg_order(
+            legs=self.SAMPLE_LEGS,
+            limit_price="cheap",
+        )
+        assert "Error" in result
+        assert "numeric string" in result
+
+    async def test_gtd_requires_expiration_time(self, patch_get_client):
+        result = await preflight_multileg_order(
+            legs=self.SAMPLE_LEGS,
+            limit_price="1.50",
+            time_in_force="GTD",
+        )
+        assert "Error" in result
+        assert "expiration_time" in result
 
 
 class TestCancelOrder:

@@ -16,10 +16,11 @@ import os
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from decimal import Decimal
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Literal, Optional
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ from public_api_sdk.models import (
     PreflightRequest,
     TimeInForce,
     Trading,
+    TradingSessionToggle,
     EquityMarketSession,
 )
 
@@ -163,6 +165,42 @@ def _parse_instrument_type(type_str: str) -> InstrumentType:
         raise ValueError(
             f"Invalid instrument type '{type_str}'. Valid types: {valid}"
         )
+
+
+class OrderLeg(BaseModel):
+    """One leg of a multi-leg options/equity order."""
+
+    symbol: str = Field(
+        description=(
+            "Option OCC symbol (e.g. 'SPY260313P00670000') for options, or "
+            "ticker (e.g. 'AAPL') for equity."
+        )
+    )
+    type: Literal["EQUITY", "OPTION"] = Field(description="Instrument type.")
+    side: Literal["BUY", "SELL"] = Field(description="Order side.")
+    open_close_indicator: Optional[Literal["OPEN", "CLOSE"]] = Field(
+        default=None,
+        description="OPEN for new positions, CLOSE to close existing. Required for option legs.",
+    )
+    ratio_quantity: int = Field(
+        default=1,
+        description="Ratio between legs in the spread (default 1).",
+    )
+
+
+def _build_leg_request(leg: OrderLeg) -> OrderLegRequest:
+    leg_kwargs: dict[str, Any] = {
+        "instrument": LegInstrument(
+            symbol=leg.symbol,
+            type=LegInstrumentType(leg.type),
+        ),
+        "side": OrderSide(leg.side),
+    }
+    if leg.open_close_indicator:
+        leg_kwargs["open_close_indicator"] = OpenCloseIndicator(leg.open_close_indicator)
+    if leg.ratio_quantity:
+        leg_kwargs["ratio_quantity"] = leg.ratio_quantity
+    return OrderLegRequest(**leg_kwargs)
 
 
 def _validate_order_params(
@@ -441,77 +479,123 @@ async def get_quotes(
         return f"Error: {e}"
 
 
+# Valid aggregations per period for get_price_history, verified empirically
+# against the historicdata endpoint. Each period accepts a contiguous window of
+# bar sizes; finer or coarser sizes outside the window are rejected by the
+# server with HTTP 400. Omit aggregation to let the server pick a default.
+_ALL_AGGREGATIONS: frozenset[str] = frozenset(
+    {
+        "ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES",
+        "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH",
+        "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR",
+    }
+)
+_VALID_AGGREGATIONS: dict[str, frozenset[str]] = {
+    "DAY": frozenset(
+        {"ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR"}
+    ),
+    "WEEK": frozenset(
+        {"FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY"}
+    ),
+    "MONTH": frozenset({"ONE_HOUR", "ONE_DAY", "ONE_WEEK"}),
+    "QUARTER": frozenset({"ONE_DAY", "ONE_WEEK", "ONE_MONTH"}),
+    "HALF_YEAR": frozenset({"ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS"}),
+    "YEAR": frozenset({"ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS"}),
+    "FIVE_YEARS": frozenset(
+        {"ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"}
+    ),
+    "TEN_YEARS": frozenset({"ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"}),
+    "ALL": frozenset({"ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"}),
+    "YTD": frozenset({"ONE_DAY", "ONE_WEEK", "ONE_MONTH"}),
+    # SINCE_PURCHASE spans an arbitrary duration (days to years depending on the
+    # purchase date), so no fixed bar-size window applies. Accept any size and
+    # let the server reject combinations that don't fit the actual span.
+    "SINCE_PURCHASE": _ALL_AGGREGATIONS,
+}
+
+
 @mcp.tool(
     annotations={
-        "title": "Get Historic Bars",
+        "title": "Get Price History",
         "readOnlyHint": True,
         "destructiveHint": False,
         "openWorldHint": True,
     },
 )
-async def get_historic_bars(
+async def get_price_history(
     symbol: str,
-    period: str,
-    instrument_type: str = "EQUITY",
-    aggregation: Optional[str] = None,
+    period: Literal[
+        "DAY", "WEEK", "MONTH", "QUARTER", "HALF_YEAR", "YEAR",
+        "FIVE_YEARS", "TEN_YEARS", "ALL", "YTD", "SINCE_PURCHASE",
+    ],
+    instrument_type: Literal["EQUITY", "CRYPTO", "OPTION", "INDEX"] = "EQUITY",
+    aggregation: Optional[Literal[
+        "ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES",
+        "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH",
+        "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR",
+    ]] = None,
     purchase_date: Optional[str] = None,
+    trading_session_toggle: Optional[Literal[
+        "REGULAR_HOURS", "REGULAR_AND_EXTENDED_HOURS", "ALL_SESSIONS",
+    ]] = None,
 ) -> str:
     """
-    Get OHLCV historic bar data for a symbol over a given time period.
+    Get historical OHLCV price bars for a symbol over a time period.
 
-    Returns pre-market, regular-market, and after-hours bars plus the last
-    regular trading session close.
+    Returns open/high/low/close/volume bars split into pre-market, regular,
+    and after-hours sessions, plus previous close and total gain/loss. Use
+    this for trend analysis and historical prices — get_quotes returns the
+    current price only, and get_history is account activity, not prices.
 
     Args:
-        symbol: Ticker symbol. Format depends on instrument_type:
-            - EQUITY: e.g. "AAPL"
-            - CRYPTO: e.g. "BTC" (do not append "-USD")
-            - OPTION: OSI-normalized symbol, e.g. "AAPL260320C00280000"
-            - INDEX: e.g. "SPX"
-        period: Time window. One of DAY, WEEK, MONTH, QUARTER, HALF_YEAR,
-            YEAR, FIVE_YEARS, YTD, SINCE_PURCHASE.
+        symbol: Ticker symbol (e.g. "AAPL").
+        period: Time window to retrieve (e.g. "YEAR", "TEN_YEARS", "ALL").
         instrument_type: EQUITY, CRYPTO, OPTION, or INDEX. Default EQUITY.
-        aggregation: Optional bar size. One of ONE_MINUTE, FIVE_MINUTES,
-            TEN_MINUTES, FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, ONE_DAY,
-            ONE_WEEK, ONE_MONTH, THREE_MONTHS, SIX_MONTHS, ONE_YEAR.
-            If omitted, the server picks an appropriate size for the period.
-        purchase_date: Required when period is SINCE_PURCHASE.
-            Format: YYYY-MM-DD.
+        aggregation: Optional bar size. Prefer omitting it — the server then
+            picks an appropriate size for the period. Only a subset of sizes
+            is valid per period (finer/coarser sizes are rejected); if you set
+            an invalid one, the error lists the valid options.
+        purchase_date: Required only when period is "SINCE_PURCHASE".
+            Format "YYYY-MM-DD".
+        trading_session_toggle: Which sessions to include on the DAY equity
+            chart. Omit for the default (REGULAR_AND_EXTENDED_HOURS,
+            04:00–20:00 ET). REGULAR_HOURS limits to 09:30–16:00. ALL_SESSIONS
+            returns a full midnight-to-midnight chart including the overnight
+            ATS sessions, adding preMarketOvernight (00:00–04:00) and
+            postMarketOvernight (20:00–24:00) to the response.
     """
-    try:
-        try:
-            period_enum = BarPeriod(period.upper())
-        except ValueError:
-            valid = [p.value for p in BarPeriod]
-            raise ValueError(f"Invalid period '{period}'. Valid: {valid}")
-
-        if period_enum == BarPeriod.SINCE_PURCHASE and not purchase_date:
-            raise ValueError(
-                "purchase_date (YYYY-MM-DD) is required when period is SINCE_PURCHASE"
-            )
-
-        kwargs: dict[str, Any] = {
-            "instrument_type": _parse_instrument_type(instrument_type),
-        }
-        if aggregation is not None:
-            try:
-                kwargs["aggregation"] = BarAggregation(aggregation.upper())
-            except ValueError:
-                valid = [a.value for a in BarAggregation]
-                raise ValueError(
-                    f"Invalid aggregation '{aggregation}'. Valid: {valid}"
+    if period == "SINCE_PURCHASE" and not purchase_date:
+        return json.dumps(
+            {"error": "purchase_date (YYYY-MM-DD) is required when period is SINCE_PURCHASE."}
+        )
+    allowed = _VALID_AGGREGATIONS.get(period)
+    if aggregation and allowed is not None and aggregation not in allowed:
+        return json.dumps(
+            {
+                "error": (
+                    f"aggregation '{aggregation}' is not valid for period '{period}'. "
+                    f"Valid: {sorted(allowed)}. Or omit aggregation to let the "
+                    f"server choose an appropriate size."
                 )
-        if purchase_date is not None:
-            kwargs["purchase_date"] = purchase_date
-
+            }
+        )
+    try:
         async with _get_client() as client:
-            bars = await client.get_bars(symbol=symbol, period=period_enum, **kwargs)
+            bars = await client.get_bars(
+                symbol=symbol,
+                period=BarPeriod(period),
+                instrument_type=_parse_instrument_type(instrument_type),
+                aggregation=BarAggregation(aggregation) if aggregation else None,
+                purchase_date=purchase_date,
+                trading_session_toggle=(
+                    TradingSessionToggle(trading_session_toggle)
+                    if trading_session_toggle
+                    else None
+                ),
+            )
             return _serialize(bars)
     except Exception as e:
-        logger.error(
-            "get_historic_bars failed (symbol=%s, period=%s, instrument_type=%s): %s",
-            symbol, period, instrument_type, e, exc_info=True,
-        )
+        logger.error("get_price_history failed (symbol=%s): %s", symbol, e, exc_info=True)
         return f"Error: {e}"
 
 
@@ -842,7 +926,7 @@ async def preflight_order(
     },
 )
 async def preflight_multileg_order(
-    legs: list[dict],
+    legs: list[OrderLeg],
     limit_price: str,
     time_in_force: str = "DAY",
     quantity: Optional[int] = None,
@@ -885,27 +969,11 @@ async def preflight_multileg_order(
         if expiration_time:
             exp_kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
 
-        leg_requests = []
-        for leg in legs:
-            # Support both flat format {"symbol": ..., "type": ...} and
-            # nested format {"instrument": {"symbol": ..., "type": ...}, ...}
-            instrument = leg.get("instrument") or {}
-            symbol = instrument.get("symbol") or leg["symbol"]
-            inst_type = instrument.get("type") or leg["type"]
-            leg_kwargs: dict[str, Any] = {
-                "instrument": LegInstrument(
-                    symbol=symbol,
-                    type=LegInstrumentType(inst_type.upper()),
-                ),
-                "side": OrderSide(leg["side"].upper()),
-            }
-            if leg.get("open_close_indicator"):
-                leg_kwargs["open_close_indicator"] = OpenCloseIndicator(
-                    leg["open_close_indicator"].upper()
-                )
-            if leg.get("ratio_quantity"):
-                leg_kwargs["ratio_quantity"] = leg["ratio_quantity"]
-            leg_requests.append(OrderLegRequest(**leg_kwargs))
+        # `legs` is list[OrderLeg] when invoked via MCP/Pydantic; when invoked
+        # directly in tests it may be list[dict]. model_validate handles both.
+        leg_requests = [
+            _build_leg_request(OrderLeg.model_validate(leg)) for leg in legs
+        ]
 
         req_kwargs: dict[str, Any] = {
             "order_type": OrderType.LIMIT,
@@ -1352,7 +1420,7 @@ async def place_order(
     },
 )
 async def place_multileg_order(
-    legs: list[dict],
+    legs: list[OrderLeg],
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
@@ -1397,27 +1465,11 @@ async def place_multileg_order(
         if expiration_time:
             exp_kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
 
-        leg_requests = []
-        for leg in legs:
-            # Support both flat format {"symbol": ..., "type": ...} and
-            # nested format {"instrument": {"symbol": ..., "type": ...}, ...}
-            instrument = leg.get("instrument") or {}
-            symbol = instrument.get("symbol") or leg["symbol"]
-            inst_type = instrument.get("type") or leg["type"]
-            leg_kwargs: dict[str, Any] = {
-                "instrument": LegInstrument(
-                    symbol=symbol,
-                    type=LegInstrumentType(inst_type.upper()),
-                ),
-                "side": OrderSide(leg["side"].upper()),
-            }
-            if leg.get("open_close_indicator"):
-                leg_kwargs["open_close_indicator"] = OpenCloseIndicator(
-                    leg["open_close_indicator"].upper()
-                )
-            if leg.get("ratio_quantity"):
-                leg_kwargs["ratio_quantity"] = leg["ratio_quantity"]
-            leg_requests.append(OrderLegRequest(**leg_kwargs))
+        # `legs` is list[OrderLeg] when invoked via MCP/Pydantic; when invoked
+        # directly in tests it may be list[dict]. model_validate handles both.
+        leg_requests = [
+            _build_leg_request(OrderLeg.model_validate(leg)) for leg in legs
+        ]
 
         req = MultilegOrderRequest(
             order_id=order_id,

@@ -8,7 +8,7 @@ from publicdotcom_mcp_server.server import (
     check_setup,
     get_accounts,
     get_all_instruments,
-    get_historic_bars,
+    get_price_history,
     get_history,
     get_instrument,
     get_option_chain,
@@ -145,21 +145,21 @@ class TestGetQuotes:
         assert "Error" in result
 
 
-class TestGetHistoricBars:
+class TestGetPriceHistory:
     async def test_returns_bars(self, patch_get_client):
         mock_client = patch_get_client
         mock_client.get_bars = AsyncMock(
             return_value=_make_model({"bars": [{"close": "200.00"}]})
         )
 
-        result = await get_historic_bars(symbol="AAPL", period="DAY")
+        result = await get_price_history(symbol="AAPL", period="DAY")
         assert '"close"' in result
 
     async def test_defaults_to_equity(self, patch_get_client):
         mock_client = patch_get_client
         mock_client.get_bars = AsyncMock(return_value=_make_model({"bars": []}))
 
-        await get_historic_bars(symbol="AAPL", period="DAY")
+        await get_price_history(symbol="AAPL", period="DAY")
         from public_api_sdk import InstrumentType
         assert mock_client.get_bars.await_args.kwargs["instrument_type"] == InstrumentType.EQUITY
 
@@ -167,7 +167,7 @@ class TestGetHistoricBars:
         mock_client = patch_get_client
         mock_client.get_bars = AsyncMock(return_value=_make_model({"bars": []}))
 
-        await get_historic_bars(
+        await get_price_history(
             symbol="BTC",
             period="WEEK",
             instrument_type="CRYPTO",
@@ -179,34 +179,74 @@ class TestGetHistoricBars:
         assert kwargs["aggregation"] == BarAggregation.ONE_HOUR
         assert kwargs["period"] == BarPeriod.WEEK
 
+    @pytest.mark.parametrize("period", ["TEN_YEARS", "ALL"])
+    async def test_new_long_range_periods_pass_through(self, patch_get_client, period):
+        # TEN_YEARS and ALL were added in a newer publicdotcom-py; confirm the
+        # tool accepts them and maps them to the BarPeriod enum.
+        mock_client = patch_get_client
+        mock_client.get_bars = AsyncMock(return_value=_make_model({"bars": []}))
+
+        await get_price_history(symbol="AAPL", period=period)
+        from public_api_sdk import BarPeriod
+        assert mock_client.get_bars.await_args.kwargs["period"] == BarPeriod(period)
+
     async def test_invalid_period_returns_error(self, patch_get_client):
-        result = await get_historic_bars(symbol="AAPL", period="NOPE")
+        result = await get_price_history(symbol="AAPL", period="NOPE")
         assert "Error" in result
         assert "period" in result.lower()
 
     async def test_invalid_instrument_type_returns_error(self, patch_get_client):
-        result = await get_historic_bars(
+        result = await get_price_history(
             symbol="AAPL", period="DAY", instrument_type="INVALID"
         )
         assert "Error" in result
 
     async def test_invalid_aggregation_returns_error(self, patch_get_client):
-        result = await get_historic_bars(
+        result = await get_price_history(
             symbol="AAPL", period="DAY", aggregation="WHENEVER"
         )
-        assert "Error" in result
+        # Invalid period/aggregation combos are rejected client-side with a
+        # structured JSON error listing the valid options for that period.
+        assert json.loads(result)["error"]
         assert "aggregation" in result.lower()
 
+    async def test_invalid_aggregation_lists_valid_options(self, patch_get_client):
+        result = await get_price_history(
+            symbol="AAPL", period="DAY", aggregation="ONE_YEAR"
+        )
+        # ONE_YEAR is a real bar size but invalid for the DAY period; the error
+        # should surface a valid size (e.g. ONE_HOUR) to guide the caller.
+        assert "ONE_HOUR" in result
+
     async def test_since_purchase_requires_purchase_date(self, patch_get_client):
-        result = await get_historic_bars(symbol="AAPL", period="SINCE_PURCHASE")
-        assert "Error" in result
-        assert "purchase_date" in result
+        result = await get_price_history(symbol="AAPL", period="SINCE_PURCHASE")
+        assert "purchase_date" in json.loads(result)["error"]
+
+    async def test_trading_session_toggle_passed_through(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_bars = AsyncMock(return_value=_make_model({"bars": []}))
+
+        await get_price_history(
+            symbol="AAPL", period="DAY", trading_session_toggle="ALL_SESSIONS"
+        )
+        from public_api_sdk.models import TradingSessionToggle
+        assert (
+            mock_client.get_bars.await_args.kwargs["trading_session_toggle"]
+            == TradingSessionToggle.ALL_SESSIONS
+        )
+
+    async def test_trading_session_toggle_defaults_to_none(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_bars = AsyncMock(return_value=_make_model({"bars": []}))
+
+        await get_price_history(symbol="AAPL", period="DAY")
+        assert mock_client.get_bars.await_args.kwargs["trading_session_toggle"] is None
 
     async def test_since_purchase_with_date_succeeds(self, patch_get_client):
         mock_client = patch_get_client
         mock_client.get_bars = AsyncMock(return_value=_make_model({"bars": []}))
 
-        await get_historic_bars(
+        await get_price_history(
             symbol="AAPL", period="SINCE_PURCHASE", purchase_date="2025-01-01"
         )
         assert mock_client.get_bars.await_args.kwargs["purchase_date"] == "2025-01-01"
@@ -215,7 +255,7 @@ class TestGetHistoricBars:
         mock_client = patch_get_client
         mock_client.get_bars = AsyncMock(side_effect=Exception("upstream 500"))
 
-        result = await get_historic_bars(symbol="AAPL", period="DAY")
+        result = await get_price_history(symbol="AAPL", period="DAY")
         assert "Error" in result
         assert "upstream 500" in result
 

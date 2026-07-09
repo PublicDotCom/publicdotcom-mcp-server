@@ -21,7 +21,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_order` | Get status of a specific order |
 | `get_history` | Transaction history (trades, deposits, dividends, etc.) |
 | `get_quotes` | Real-time quotes for stocks, crypto, options |
-| `get_historic_bars` | OHLCV historic bars for equities, crypto, options, or indices |
+| `get_price_history` | OHLCV price history for equities, crypto, options, or indices |
 | `get_instrument` | Details about a specific tradeable instrument |
 | `get_all_instruments` | List all available instruments with filters |
 | `get_option_expirations` | Available expiration dates for options |
@@ -181,7 +181,8 @@ Public.com Trading API
 
 All tools include proper [MCP tool annotations](https://modelcontextprotocol.io/docs/concepts/tools#tool-annotations):
 - Read-only tools are marked with `readOnlyHint: true`
-- Write tools are marked with `destructiveHint: true`
+- Order-placement tools are marked with `readOnlyHint: false` (they modify account state)
+- Order cancellation tools (`cancel_order`, `cancel_and_replace_order`) are additionally marked with `destructiveHint: true`
 
 ## License
 
