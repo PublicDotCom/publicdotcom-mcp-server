@@ -13,15 +13,14 @@ Requires:
 import json
 import logging
 import os
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from decimal import Decimal
-from typing import Any, AsyncGenerator, Literal, Optional
+from typing import Any, Literal
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field
-from starlette.middleware.base import BaseHTTPMiddleware
 
 # ---------------------------------------------------------------------------
 # SDK import — installed via `pip install publicdotcom-py`
@@ -37,6 +36,7 @@ from public_api_sdk import (
 )
 from public_api_sdk.models import (
     CancelAndReplaceRequest,
+    EquityMarketSession,
     HistoryRequest,
     InstrumentsRequest,
     LegInstrument,
@@ -55,8 +55,9 @@ from public_api_sdk.models import (
     TimeInForce,
     Trading,
     TradingSessionToggle,
-    EquityMarketSession,
 )
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ mcp = FastMCP(
 
 @asynccontextmanager
 async def _get_client(
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> AsyncGenerator[AsyncPublicApiClient, None]:
     """Yield a cached SDK client for the current API key.
 
@@ -164,7 +165,7 @@ def _parse_instrument_type(type_str: str) -> InstrumentType:
         valid = [t.value for t in InstrumentType]
         raise ValueError(
             f"Invalid instrument type '{type_str}'. Valid types: {valid}"
-        )
+        ) from None
 
 
 class OrderLeg(BaseModel):
@@ -178,7 +179,7 @@ class OrderLeg(BaseModel):
     )
     type: Literal["EQUITY", "OPTION"] = Field(description="Instrument type.")
     side: Literal["BUY", "SELL"] = Field(description="Order side.")
-    open_close_indicator: Optional[Literal["OPEN", "CLOSE"]] = Field(
+    open_close_indicator: Literal["OPEN", "CLOSE"] | None = Field(
         default=None,
         description="OPEN for new positions, CLOSE to close existing. Required for option legs.",
     )
@@ -205,15 +206,15 @@ def _build_leg_request(leg: OrderLeg) -> OrderLegRequest:
 
 def _validate_order_params(
     *,
-    quantity: Optional[str],
-    amount: Optional[str],
+    quantity: str | None,
+    amount: str | None,
     order_type: str,
-    limit_price: Optional[str],
-    stop_price: Optional[str],
-    instrument_type: Optional[str] = None,
-    open_close_indicator: Optional[str] = None,
-    time_in_force: Optional[str] = None,
-    expiration_time: Optional[str] = None,
+    limit_price: str | None,
+    stop_price: str | None,
+    instrument_type: str | None = None,
+    open_close_indicator: str | None = None,
+    time_in_force: str | None = None,
+    expiration_time: str | None = None,
 ) -> None:
     """Validate order parameters and raise ValueError with a clear message on violation."""
     if quantity is not None and amount is not None:
@@ -236,7 +237,7 @@ def _validate_order_params(
             try:
                 Decimal(raw_value)
             except Exception:
-                raise ValueError(f"{field_name} must be a numeric string, got: {raw_value!r}")
+                raise ValueError(f"{field_name} must be a numeric string, got: {raw_value!r}") from None
 
 
 # ========================================================================
@@ -276,7 +277,7 @@ async def check_setup() -> str:
             default = os.environ.get("PUBLIC_COM_ACCOUNT_ID", "(not set)")
             return (
                 "✅ Authenticated successfully.\n"
-                f"Accounts found:\n" + "\n".join(acct_list) + "\n"
+                "Accounts found:\n" + "\n".join(acct_list) + "\n"
                 f"Default account ID: {default}"
             )
     except Exception as e:
@@ -314,7 +315,7 @@ async def get_accounts() -> str:
         "openWorldHint": True,
     },
 )
-async def get_portfolio(account_id: Optional[str] = None) -> str:
+async def get_portfolio(account_id: str | None = None) -> str:
     """
     Get a snapshot of the account portfolio.
 
@@ -341,7 +342,7 @@ async def get_portfolio(account_id: Optional[str] = None) -> str:
         "openWorldHint": True,
     },
 )
-async def get_orders(account_id: Optional[str] = None) -> str:
+async def get_orders(account_id: str | None = None) -> str:
     """
     Get all open/active orders on the account.
 
@@ -370,7 +371,7 @@ async def get_orders(account_id: Optional[str] = None) -> str:
         "openWorldHint": True,
     },
 )
-async def get_order(order_id: str, account_id: Optional[str] = None) -> str:
+async def get_order(order_id: str, account_id: str | None = None) -> str:
     """
     Get the status and details of a specific order.
 
@@ -399,11 +400,11 @@ async def get_order(order_id: str, account_id: Optional[str] = None) -> str:
     },
 )
 async def get_history(
-    account_id: Optional[str] = None,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    page_size: Optional[int] = None,
-    next_token: Optional[str] = None,
+    account_id: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    page_size: int | None = None,
+    next_token: str | None = None,
 ) -> str:
     """
     Retrieve account transaction history.
@@ -454,7 +455,7 @@ async def get_history(
 async def get_quotes(
     symbols: list[str],
     instrument_type: str = "EQUITY",
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get real-time quotes for one or more symbols.
@@ -529,15 +530,9 @@ async def get_price_history(
         "FIVE_YEARS", "TEN_YEARS", "ALL", "YTD", "SINCE_PURCHASE",
     ],
     instrument_type: Literal["EQUITY", "CRYPTO", "OPTION", "INDEX"] = "EQUITY",
-    aggregation: Optional[Literal[
-        "ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES",
-        "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH",
-        "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR",
-    ]] = None,
-    purchase_date: Optional[str] = None,
-    trading_session_toggle: Optional[Literal[
-        "REGULAR_HOURS", "REGULAR_AND_EXTENDED_HOURS", "ALL_SESSIONS",
-    ]] = None,
+    aggregation: Literal["ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"] | None = None,
+    purchase_date: str | None = None,
+    trading_session_toggle: Literal["REGULAR_HOURS", "REGULAR_AND_EXTENDED_HOURS", "ALL_SESSIONS"] | None = None,
 ) -> str:
     """
     Get historical OHLCV price bars for a symbol over a time period.
@@ -640,9 +635,9 @@ async def get_instrument(symbol: str, instrument_type: str = "EQUITY") -> str:
     },
 )
 async def get_all_instruments(
-    type_filter: Optional[list[str]] = None,
-    trading_filter: Optional[list[str]] = None,
-    account_id: Optional[str] = None,
+    type_filter: list[str] | None = None,
+    trading_filter: list[str] | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     List all available tradeable instruments with optional filters.
@@ -688,7 +683,7 @@ async def get_all_instruments(
 async def get_option_expirations(
     symbol: str,
     instrument_type: str = "EQUITY",
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get available option expiration dates for a symbol.
@@ -725,7 +720,7 @@ async def get_option_chain(
     symbol: str,
     expiration_date: str,
     instrument_type: str = "EQUITY",
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get the full option chain (calls and puts) for a symbol and expiration.
@@ -762,7 +757,7 @@ async def get_option_chain(
 )
 async def get_option_greeks(
     osi_symbols: list[str],
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get option Greeks (delta, gamma, theta, vega, rho, IV) for option symbols.
@@ -793,7 +788,7 @@ async def get_option_greeks(
 )
 async def get_option_greek(
     osi_symbol: str,
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Get option Greeks (delta, gamma, theta, vega, rho, IV) for a single option symbol.
@@ -832,14 +827,14 @@ async def preflight_order(
     order_side: str,
     order_type: str,
     time_in_force: str = "DAY",
-    quantity: Optional[str] = None,
-    amount: Optional[str] = None,
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    open_close_indicator: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
-    account_id: Optional[str] = None,
+    quantity: str | None = None,
+    amount: str | None = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    open_close_indicator: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs and impact of a potential single-leg trade before placing it.
@@ -929,9 +924,9 @@ async def preflight_multileg_order(
     legs: list[OrderLeg],
     limit_price: str,
     time_in_force: str = "DAY",
-    quantity: Optional[int] = None,
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    quantity: int | None = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a multi-leg (options strategy) trade before placing it.
@@ -963,7 +958,7 @@ async def preflight_multileg_order(
         try:
             Decimal(limit_price)
         except Exception:
-            raise ValueError(f"limit_price must be a numeric string, got: {limit_price!r}")
+            raise ValueError(f"limit_price must be a numeric string, got: {limit_price!r}") from None
 
         exp_kwargs: dict[str, Any] = {"time_in_force": TimeInForce(time_in_force.upper())}
         if expiration_time:
@@ -1008,11 +1003,11 @@ async def preflight_short_order(
     quantity: str,
     order_type: str = "MARKET",
     time_in_force: str = "DAY",
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
-    account_id: Optional[str] = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a short-sale equity order before placing it.
@@ -1080,8 +1075,8 @@ async def preflight_call_credit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a Bear Call Spread (call credit spread) before placing it.
@@ -1133,8 +1128,8 @@ async def preflight_call_debit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a Bull Call Spread (call debit spread) before placing it.
@@ -1186,8 +1181,8 @@ async def preflight_put_credit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a Bull Put Spread (put credit spread) before placing it.
@@ -1239,8 +1234,8 @@ async def preflight_put_debit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Estimate costs for a Bear Put Spread (put debit spread) before placing it.
@@ -1298,14 +1293,14 @@ async def place_order(
     order_side: str,
     order_type: str,
     time_in_force: str = "DAY",
-    quantity: Optional[str] = None,
-    amount: Optional[str] = None,
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    open_close_indicator: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
-    account_id: Optional[str] = None,
+    quantity: str | None = None,
+    amount: str | None = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    open_close_indicator: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a single-leg order (buy/sell stocks, crypto, or options).
@@ -1424,8 +1419,8 @@ async def place_multileg_order(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a multi-leg order (options strategies: spreads, straddles, etc.).
@@ -1459,7 +1454,7 @@ async def place_multileg_order(
         try:
             Decimal(limit_price)
         except Exception:
-            raise ValueError(f"limit_price must be a numeric string, got: {limit_price!r}")
+            raise ValueError(f"limit_price must be a numeric string, got: {limit_price!r}") from None
 
         exp_kwargs: dict[str, Any] = {"time_in_force": TimeInForce(time_in_force.upper())}
         if expiration_time:
@@ -1529,8 +1524,8 @@ async def place_call_credit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a Bear Call Spread (call credit spread).
@@ -1600,8 +1595,8 @@ async def place_call_debit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a Bull Call Spread (call debit spread).
@@ -1671,8 +1666,8 @@ async def place_put_credit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a Bull Put Spread (put credit spread).
@@ -1742,8 +1737,8 @@ async def place_put_debit_spread(
     quantity: int,
     limit_price: str,
     time_in_force: str = "DAY",
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place a Bear Put Spread (put debit spread).
@@ -1812,11 +1807,11 @@ async def place_short_order(
     quantity: str,
     order_type: str = "MARKET",
     time_in_force: str = "DAY",
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
-    account_id: Optional[str] = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Place an equity short-sale order.
@@ -1907,12 +1902,12 @@ async def flatten_and_go_short(
     short_quantity: str,
     order_type: str = "MARKET",
     time_in_force: str = "DAY",
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    equity_market_session: Optional[str] = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    expiration_time: str | None = None,
+    equity_market_session: str | None = None,
     flatten_timeout: float = 60.0,
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Sell any existing long position in a symbol, then place a short-sale order.
@@ -2008,7 +2003,7 @@ async def flatten_and_go_short(
 )
 async def cancel_order(
     order_id: str,
-    account_id: Optional[str] = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Cancel an existing order.
@@ -2054,11 +2049,11 @@ async def cancel_and_replace_order(
     order_id: str,
     order_type: str,
     time_in_force: str = "DAY",
-    quantity: Optional[str] = None,
-    limit_price: Optional[str] = None,
-    stop_price: Optional[str] = None,
-    expiration_time: Optional[str] = None,
-    account_id: Optional[str] = None,
+    quantity: str | None = None,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+    expiration_time: str | None = None,
+    account_id: str | None = None,
 ) -> str:
     """
     Atomically cancel an existing order and replace it with new parameters.

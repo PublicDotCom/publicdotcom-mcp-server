@@ -2,8 +2,6 @@
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 from publicdotcom_mcp_server.server import (
     cancel_and_replace_order,
     cancel_order,

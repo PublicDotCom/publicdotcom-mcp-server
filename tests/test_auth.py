@@ -1,14 +1,14 @@
 """Tests for per-request auth (ContextVars + ApiKeyMiddleware)."""
 
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from starlette.testclient import TestClient
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
+from starlette.testclient import TestClient
 
 import publicdotcom_mcp_server.server as srv
-
 
 # ---------------------------------------------------------------------------
 # _get_client — ContextVar resolution

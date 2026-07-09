@@ -3,6 +3,7 @@ import json
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from publicdotcom_mcp_server.server import (
     OrderLeg,
@@ -229,7 +230,7 @@ class TestOrderLeg:
         assert leg.ratio_quantity == 2
 
     def test_invalid_side_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             OrderLeg(symbol="AAPL", type="EQUITY", side="HOLD")
 
 

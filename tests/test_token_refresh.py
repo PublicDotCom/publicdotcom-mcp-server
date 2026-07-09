@@ -18,11 +18,9 @@ Expiry is simulated by backdating _access_token_expires_at directly.
 import time
 from unittest.mock import patch
 
-import pytest
-
-import publicdotcom_mcp_server.server as srv
 from public_api_sdk.async_auth_provider import AsyncApiKeyAuthProvider
 
+import publicdotcom_mcp_server.server as srv
 
 # ---------------------------------------------------------------------------
 # Helpers

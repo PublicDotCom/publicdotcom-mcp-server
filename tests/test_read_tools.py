@@ -8,7 +8,6 @@ from publicdotcom_mcp_server.server import (
     check_setup,
     get_accounts,
     get_all_instruments,
-    get_price_history,
     get_history,
     get_instrument,
     get_option_chain,
@@ -17,6 +16,7 @@ from publicdotcom_mcp_server.server import (
     get_order,
     get_orders,
     get_portfolio,
+    get_price_history,
     get_quotes,
 )
 
