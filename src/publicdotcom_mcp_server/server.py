@@ -1892,7 +1892,10 @@ async def place_short_order(
     annotations={
         "title": "Flatten and Go Short",
         "readOnlyHint": False,
-        "destructiveHint": False,
+        # Unlike the place_* tools, which only add a new order, this closes an
+        # existing position before opening the short. That destroys prior state,
+        # so clients should confirm with the user before executing.
+        "destructiveHint": True,
         "idempotentHint": False,
         "openWorldHint": True,
     },

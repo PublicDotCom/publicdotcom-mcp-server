@@ -1,10 +1,12 @@
 """Tests for write (order placement) MCP tools."""
 import json
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 from publicdotcom_mcp_server.server import (
     cancel_and_replace_order,
     cancel_order,
+    flatten_and_go_short,
     mcp,
     place_multileg_order,
     place_order,
@@ -46,6 +48,21 @@ class TestToolAnnotations:
         # marked destructive (matches the hosted server's annotations).
         tool = _get_tool("place_order")
         assert tool.annotations.destructiveHint is False
+
+    def test_flatten_and_go_short_destructive_hint_is_true(self):
+        # flatten_and_go_short closes an existing position before shorting, so
+        # unlike the place_* tools it destroys prior state. Clients rely on this
+        # hint to decide whether to confirm with the user before executing.
+        tool = _get_tool("flatten_and_go_short")
+        assert tool.annotations.destructiveHint is True
+
+    def test_flatten_and_go_short_is_not_read_only(self):
+        tool = _get_tool("flatten_and_go_short")
+        assert tool.annotations.readOnlyHint is False
+
+    def test_flatten_and_go_short_idempotent_hint_is_false(self):
+        tool = _get_tool("flatten_and_go_short")
+        assert tool.annotations.idempotentHint is False
 
     def test_read_only_tools_open_world_hint_is_true(self):
         for name in [
@@ -264,6 +281,93 @@ class TestPreflightMultilegOrder:
         )
         assert "Error" in result
         assert "expiration_time" in result
+
+
+class TestFlattenAndGoShort:
+    @staticmethod
+    def _result(flatten_order_id="flatten-order-uuid", initial_position_quantity="10"):
+        result = MagicMock()
+        result.short_order.order_id = "short-order-uuid"
+        result.initial_position_quantity = initial_position_quantity
+        if flatten_order_id is None:
+            result.flatten_order = None
+        else:
+            result.flatten_order.order_id = flatten_order_id
+        return result
+
+    async def test_successful_flatten_and_short(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.flatten_and_go_short = AsyncMock(return_value=self._result())
+
+        result = await flatten_and_go_short(symbol="AAPL", short_quantity="5")
+        data = json.loads(result)
+        assert data["status"] == "submitted"
+        assert data["short_order_id"] == "short-order-uuid"
+        assert data["flatten_order_id"] == "flatten-order-uuid"
+        assert data["initial_position_quantity"] == "10"
+        assert "two-order workflow" in data["message"]
+
+    async def test_no_existing_position_reports_null_flatten_order(self, patch_get_client):
+        """With no long position the flatten step is skipped, not failed."""
+        mock_client = patch_get_client
+        mock_client.flatten_and_go_short = AsyncMock(
+            return_value=self._result(flatten_order_id=None, initial_position_quantity="0")
+        )
+
+        result = await flatten_and_go_short(symbol="AAPL", short_quantity="5")
+        data = json.loads(result)
+        assert data["status"] == "submitted"
+        assert data["flatten_order_id"] is None
+        assert data["short_order_id"] == "short-order-uuid"
+
+    async def test_decimal_and_enum_coercion_passed_to_client(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.flatten_and_go_short = AsyncMock(return_value=self._result())
+
+        await flatten_and_go_short(
+            symbol="AAPL",
+            short_quantity="5",
+            order_type="LIMIT",
+            limit_price="150.25",
+            flatten_timeout=30.0,
+        )
+        kwargs = mock_client.flatten_and_go_short.await_args.kwargs
+        assert kwargs["short_quantity"] == Decimal("5")
+        assert kwargs["limit_price"] == Decimal("150.25")
+        assert kwargs["order_type"].value == "LIMIT"
+        assert kwargs["flatten_timeout"] == 30.0
+
+    async def test_validation_error_for_limit_without_price(self, patch_get_client):
+        result = await flatten_and_go_short(
+            symbol="AAPL",
+            short_quantity="5",
+            order_type="LIMIT",
+            # limit_price intentionally omitted
+        )
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert "limit_price" in data["message"]
+
+    async def test_gtd_requires_expiration_time(self, patch_get_client):
+        result = await flatten_and_go_short(
+            symbol="AAPL",
+            short_quantity="5",
+            time_in_force="GTD",
+            # expiration_time intentionally omitted
+        )
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert "expiration_time" in data["message"]
+
+    async def test_api_error_returns_error_json_with_symbol(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.flatten_and_go_short = AsyncMock(side_effect=Exception("flatten timed out"))
+
+        result = await flatten_and_go_short(symbol="AAPL", short_quantity="5")
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert data["symbol"] == "AAPL"
+        assert "flatten timed out" in data["message"]
 
 
 class TestCancelOrder:
