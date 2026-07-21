@@ -37,6 +37,7 @@ from public_api_sdk import (
 from public_api_sdk.models import (
     CancelAndReplaceRequest,
     EquityMarketSession,
+    GatewayTaxLotMatchingInstruction,
     HistoryRequest,
     InstrumentsRequest,
     LegInstrument,
@@ -52,6 +53,8 @@ from public_api_sdk.models import (
     OrderType,
     PreflightMultiLegRequest,
     PreflightRequest,
+    StrategyOrderLeg,
+    StrategyQuoteRequest,
     TimeInForce,
     Trading,
     TradingSessionToggle,
@@ -204,6 +207,37 @@ def _build_leg_request(leg: OrderLeg) -> OrderLegRequest:
     return OrderLegRequest(**leg_kwargs)
 
 
+class StrategyLeg(BaseModel):
+    """One leg of a strategy-quote request (option or equity)."""
+
+    symbol: str = Field(
+        description=(
+            "Option OCC symbol (e.g. 'SPY260313P00670000') for option legs, or "
+            "ticker (e.g. 'SPY') for the equity leg."
+        )
+    )
+    side: Literal["BUY", "SELL"] = Field(description="Leg side.")
+    open_close_indicator: Literal["OPEN", "CLOSE"] | None = Field(
+        default=None,
+        description="OPEN for new positions, CLOSE to close existing. Required for option legs.",
+    )
+    ratio_quantity: int = Field(
+        default=1,
+        description="Ratio between legs in the strategy (default 1).",
+    )
+
+
+def _build_strategy_leg(leg: StrategyLeg) -> StrategyOrderLeg:
+    leg_kwargs: dict[str, Any] = {
+        "symbol": leg.symbol,
+        "side": OrderSide(leg.side),
+        "ratio_quantity": leg.ratio_quantity,
+    }
+    if leg.open_close_indicator:
+        leg_kwargs["open_close_indicator"] = OpenCloseIndicator(leg.open_close_indicator)
+    return StrategyOrderLeg(**leg_kwargs)
+
+
 def _validate_order_params(
     *,
     quantity: str | None,
@@ -319,8 +353,9 @@ async def get_portfolio(account_id: str | None = None) -> str:
     """
     Get a snapshot of the account portfolio.
 
-    Returns positions, equity breakdown, buying power, and open orders.
-    Only non-IRA accounts are supported.
+    Returns positions, equity breakdown, buying power, open orders, and
+    cash/withdrawal figures (including cash, totalAccountValue, and
+    availableToWithdraw). Only non-IRA accounts are supported.
 
     Args:
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
@@ -809,6 +844,164 @@ async def get_option_greek(
 
 
 # ========================================================================
+# TAX LOTS & STRATEGY QUOTE — READ-ONLY
+# ========================================================================
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Tax Lots",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_tax_lots(account_id: str | None = None) -> str:
+    """
+    Get the unrealized tax-lot summary for the account.
+
+    Returns per-lot unrealized gain/loss, holding term (short/long/60-40),
+    cost basis, and the aggregate totals across all lots. Requires the API
+    key to have the `portfolio` scope.
+
+    Args:
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    try:
+        async with _get_client(account_id) as client:
+            result = await client.get_unrealized_tax_lots(account_id=account_id)
+            return _serialize(result)
+    except Exception as e:
+        logger.error("get_tax_lots failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Tax Lots For Symbol",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_tax_lots_for_symbol(
+    symbol: str,
+    price: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    """
+    Get the unrealized tax-lot detail for a single symbol.
+
+    Returns each open lot for the symbol with its unrealized gain/loss,
+    holding term, and cost basis. Requires the API key to have the
+    `portfolio` scope.
+
+    Args:
+        symbol: Ticker symbol (e.g. "AAPL").
+        price: Optional price (as a numeric string) to value the lots against.
+            Omit to use the current market price.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    try:
+        async with _get_client(account_id) as client:
+            result = await client.get_unrealized_tax_lots_for_symbol(
+                symbol=symbol, account_id=account_id, price=price
+            )
+            return _serialize(result)
+    except Exception as e:
+        logger.error("get_tax_lots_for_symbol failed (symbol=%s): %s", symbol, e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Tax Lots CSV",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_tax_lots_csv(account_id: str | None = None) -> str:
+    """
+    Export the unrealized tax lots as a CSV file.
+
+    Returns a file object with `fileName` and `base64Data`. The CSV contents
+    are Base64-encoded in the `base64Data` field — decode it to recover the
+    raw CSV text. Requires the API key to have the `portfolio` scope.
+
+    Args:
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    try:
+        async with _get_client(account_id) as client:
+            result = await client.get_unrealized_tax_lots_csv(account_id=account_id)
+            return _serialize(result)
+    except Exception as e:
+        logger.error("get_tax_lots_csv failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Strategy Quote",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_strategy_quote(
+    base_symbol: str,
+    option_legs: list[StrategyLeg],
+    equity_leg: StrategyLeg | None = None,
+    account_id: str | None = None,
+) -> str:
+    """
+    Get a consolidated quote for a multi-leg option strategy.
+
+    Prices the strategy as a whole (debit/credit, bid/ask/mark, net price)
+    from its option legs and optional equity leg. This is a read-only quote —
+    it does NOT place or preflight an order.
+
+    Args:
+        base_symbol: Underlying ticker for the strategy (e.g. "SPY").
+        option_legs: List of option leg objects. Each leg must have:
+            - symbol (str): The option OCC symbol (e.g. "SPY260313P00670000")
+            - side (str): BUY or SELL
+            - open_close_indicator (str, optional): OPEN or CLOSE
+            - ratio_quantity (int, optional): Ratio between legs (default 1)
+          Example: [{"symbol": "SPY260313P00670000", "side": "SELL",
+                     "open_close_indicator": "OPEN", "ratio_quantity": 1},
+                    {"symbol": "SPY260313P00665000", "side": "BUY",
+                     "open_close_indicator": "OPEN", "ratio_quantity": 1}]
+        equity_leg: Optional equity leg (same shape as an option leg, with an
+            equity ticker as the symbol) for strategies that pair options with
+            stock (e.g. a covered call or collar).
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    try:
+        # `option_legs`/`equity_leg` arrive as StrategyLeg when invoked via
+        # MCP/Pydantic; when invoked directly in tests they may be dicts.
+        # model_validate handles both.
+        req_kwargs: dict[str, Any] = {
+            "base_symbol": base_symbol,
+            "option_legs": [
+                _build_strategy_leg(StrategyLeg.model_validate(leg)) for leg in option_legs
+            ],
+        }
+        if equity_leg is not None:
+            req_kwargs["equity_leg"] = _build_strategy_leg(
+                StrategyLeg.model_validate(equity_leg)
+            )
+        req = StrategyQuoteRequest(**req_kwargs)
+        async with _get_client(account_id) as client:
+            result = await client.get_strategy_quote(request=req, account_id=account_id)
+            return _serialize(result)
+    except Exception as e:
+        logger.error("get_strategy_quote failed (base_symbol=%s): %s", base_symbol, e, exc_info=True)
+        return f"Error: {e}"
+
+
+# ========================================================================
 # PREFLIGHT (cost estimation) — READ-ONLY
 # ========================================================================
 
@@ -834,6 +1027,7 @@ async def preflight_order(
     open_close_indicator: str | None = None,
     expiration_time: str | None = None,
     equity_market_session: str | None = None,
+    tax_lot_matching_instructions: list[dict] | None = None,
     account_id: str | None = None,
 ) -> str:
     """
@@ -855,6 +1049,14 @@ async def preflight_order(
         open_close_indicator: For options only — OPEN or CLOSE.
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         equity_market_session: CORE or EXTENDED. For equity orders only.
+        tax_lot_matching_instructions: Optional list of specific tax lots to
+            sell, each a dict {"tax_lot_id": str, "quantity": str}. Constraints
+            enforced by the API: at most 8 per request; only for a SELL equity
+            order with open_close_indicator=CLOSE; every lot must be the same
+            symbol as the order; only MARKET or good-for-day LIMIT orders;
+            the quantities must sum to the order quantity; and the account's
+            tax-lot information must have been updated today. Omit to let the
+            broker apply its default lot-matching.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
     from datetime import datetime as dt
@@ -900,6 +1102,10 @@ async def preflight_order(
             req_kwargs["equity_market_session"] = EquityMarketSession(
                 equity_market_session.upper()
             )
+        if tax_lot_matching_instructions:
+            req_kwargs["tax_lot_matching_instructions"] = [
+                GatewayTaxLotMatchingInstruction(**d) for d in tax_lot_matching_instructions
+            ]
 
         req = PreflightRequest(**req_kwargs)
         async with _get_client(account_id) as client:
@@ -1300,6 +1506,7 @@ async def place_order(
     open_close_indicator: str | None = None,
     expiration_time: str | None = None,
     equity_market_session: str | None = None,
+    tax_lot_matching_instructions: list[dict] | None = None,
     account_id: str | None = None,
 ) -> str:
     """
@@ -1320,6 +1527,14 @@ async def place_order(
         open_close_indicator: For options only — OPEN or CLOSE.
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         equity_market_session: CORE or EXTENDED. For equity orders only.
+        tax_lot_matching_instructions: Optional list of specific tax lots to
+            sell, each a dict {"tax_lot_id": str, "quantity": str}. Constraints
+            enforced by the API: at most 8 per request; only for a SELL equity
+            order with open_close_indicator=CLOSE; every lot must be the same
+            symbol as the order; only MARKET or good-for-day LIMIT orders;
+            the quantities must sum to the order quantity; and the account's
+            tax-lot information must have been updated today. Omit to let the
+            broker apply its default lot-matching.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
     from datetime import datetime as dt
@@ -1368,6 +1583,10 @@ async def place_order(
             req_kwargs["equity_market_session"] = EquityMarketSession(
                 equity_market_session.upper()
             )
+        if tax_lot_matching_instructions:
+            req_kwargs["tax_lot_matching_instructions"] = [
+                GatewayTaxLotMatchingInstruction(**d) for d in tax_lot_matching_instructions
+            ]
 
         req = OrderRequest(**req_kwargs)
         logger.info(

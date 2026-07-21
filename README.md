@@ -28,6 +28,10 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_option_chain` | Full option chain (calls + puts) for a symbol |
 | `get_option_greeks` | Greeks (delta, gamma, theta, vega, rho, IV) for multiple options |
 | `get_option_greek` | Greeks for a single option symbol |
+| `get_tax_lots` | Unrealized tax-lot summary (per-lot gain/loss, term, cost basis) |
+| `get_tax_lots_for_symbol` | Unrealized tax-lot detail for a single symbol |
+| `get_tax_lots_csv` | Export unrealized tax lots as a Base64-encoded CSV file |
+| `get_strategy_quote` | Consolidated quote for a multi-leg option strategy |
 | `preflight_order` | Estimate costs/impact before placing a single-leg order |
 | `preflight_multileg_order` | Estimate costs for multi-leg options strategies |
 | `preflight_short_order` | Estimate costs before placing a short-sale order |
@@ -40,7 +44,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 
 | Tool | Description |
 |------|-------------|
-| `place_order` | Place a single-leg order (stocks, crypto, options) |
+| `place_order` | Place a single-leg order (stocks, crypto, options); optionally target specific tax lots via `tax_lot_matching_instructions` |
 | `place_multileg_order` | Place multi-leg orders (spreads, straddles, etc.) |
 | `place_call_credit_spread` | Place a Bear Call Spread |
 | `place_call_debit_spread` | Place a Bull Call Spread |
