@@ -18,6 +18,10 @@ from publicdotcom_mcp_server.server import (
     get_portfolio,
     get_price_history,
     get_quotes,
+    get_strategy_quote,
+    get_tax_lots,
+    get_tax_lots_csv,
+    get_tax_lots_for_symbol,
 )
 
 
@@ -412,4 +416,138 @@ class TestGetOptionChain:
         mock_client.get_option_chain = AsyncMock(side_effect=Exception("no chain"))
 
         result = await get_option_chain(symbol="AAPL", expiration_date="2026-03-21")
+        assert "Error" in result
+
+
+class TestGetTaxLots:
+    async def test_returns_serialized_summary(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_unrealized_tax_lots = AsyncMock(
+            return_value=_make_model({"totalProfitLoss": "123.45", "lots": []})
+        )
+
+        result = await get_tax_lots()
+        assert "totalProfitLoss" in result
+        mock_client.get_unrealized_tax_lots.assert_awaited_once_with(account_id=None)
+
+    async def test_passes_account_id(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_unrealized_tax_lots = AsyncMock(
+            return_value=_make_model({"lots": []})
+        )
+
+        await get_tax_lots(account_id="acct-9")
+        mock_client.get_unrealized_tax_lots.assert_awaited_once_with(account_id="acct-9")
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_unrealized_tax_lots = AsyncMock(side_effect=Exception("no scope"))
+
+        result = await get_tax_lots()
+        assert "Error" in result
+        assert "no scope" in result
+
+
+class TestGetTaxLotsForSymbol:
+    async def test_returns_serialized_detail(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_unrealized_tax_lots_for_symbol = AsyncMock(
+            return_value=_make_model({"symbol": "AAPL", "lots": []})
+        )
+
+        result = await get_tax_lots_for_symbol(symbol="AAPL")
+        assert "AAPL" in result
+
+    async def test_passes_symbol_price_and_account(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_unrealized_tax_lots_for_symbol = AsyncMock(
+            return_value=_make_model({"symbol": "AAPL"})
+        )
+
+        await get_tax_lots_for_symbol(symbol="AAPL", price="150.00", account_id="acct-9")
+        mock_client.get_unrealized_tax_lots_for_symbol.assert_awaited_once_with(
+            symbol="AAPL", account_id="acct-9", price="150.00"
+        )
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_unrealized_tax_lots_for_symbol = AsyncMock(
+            side_effect=Exception("not found")
+        )
+
+        result = await get_tax_lots_for_symbol(symbol="ZZZ")
+        assert "Error" in result
+
+
+class TestGetTaxLotsCsv:
+    async def test_returns_base64_file(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_unrealized_tax_lots_csv = AsyncMock(
+            return_value=_make_model({"fileName": "taxlots.csv", "base64Data": "Y29s"})
+        )
+
+        result = await get_tax_lots_csv()
+        assert "base64Data" in result
+        mock_client.get_unrealized_tax_lots_csv.assert_awaited_once_with(account_id=None)
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_unrealized_tax_lots_csv = AsyncMock(side_effect=Exception("boom"))
+
+        result = await get_tax_lots_csv()
+        assert "Error" in result
+
+
+class TestGetStrategyQuote:
+    SAMPLE_OPTION_LEGS = [
+        {"symbol": "SPY260313P00670000", "side": "SELL", "open_close_indicator": "OPEN", "ratio_quantity": 1},
+        {"symbol": "SPY260313P00665000", "side": "BUY", "open_close_indicator": "OPEN", "ratio_quantity": 1},
+    ]
+
+    async def test_returns_serialized_quote(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_strategy_quote = AsyncMock(
+            return_value=_make_model({"debitCredit": "CREDIT", "mark": "1.20"})
+        )
+
+        result = await get_strategy_quote(
+            base_symbol="SPY", option_legs=self.SAMPLE_OPTION_LEGS
+        )
+        assert "debitCredit" in result
+
+    async def test_builds_typed_request(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_strategy_quote = AsyncMock(
+            return_value=_make_model({"mark": "1.20"})
+        )
+
+        await get_strategy_quote(base_symbol="SPY", option_legs=self.SAMPLE_OPTION_LEGS)
+        # dict legs are coerced through the typed StrategyLeg model into the request
+        req = mock_client.get_strategy_quote.await_args.kwargs["request"]
+        assert req.base_symbol == "SPY"
+        assert len(req.option_legs) == 2
+        assert req.option_legs[0].symbol == "SPY260313P00670000"
+
+    async def test_equity_leg_passed_through(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_strategy_quote = AsyncMock(
+            return_value=_make_model({"mark": "1.20"})
+        )
+
+        await get_strategy_quote(
+            base_symbol="SPY",
+            option_legs=[self.SAMPLE_OPTION_LEGS[0]],
+            equity_leg={"symbol": "SPY", "side": "BUY", "ratio_quantity": 100},
+        )
+        req = mock_client.get_strategy_quote.await_args.kwargs["request"]
+        assert req.equity_leg is not None
+        assert req.equity_leg.symbol == "SPY"
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_strategy_quote = AsyncMock(side_effect=Exception("bad legs"))
+
+        result = await get_strategy_quote(
+            base_symbol="SPY", option_legs=self.SAMPLE_OPTION_LEGS
+        )
         assert "Error" in result

@@ -11,6 +11,7 @@ from publicdotcom_mcp_server.server import (
     place_multileg_order,
     place_order,
     preflight_multileg_order,
+    preflight_order,
 )
 
 
@@ -441,3 +442,69 @@ class TestCancelAndReplaceOrder:
         data = json.loads(result)
         assert data["status"] == "error"
         assert "expiration_time" in data["message"]
+
+
+class TestTaxLotMatchingInstructions:
+    """place_order/preflight_order forward the optional tax-lot selection."""
+
+    INSTRUCTIONS = [
+        {"tax_lot_id": "lot-1", "quantity": "3"},
+        {"tax_lot_id": "lot-2", "quantity": "2"},
+    ]
+
+    async def test_place_order_passes_instructions_through(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_result = MagicMock()
+        mock_result.order_id = "order-uuid"
+        mock_client.place_order = AsyncMock(return_value=mock_result)
+
+        await place_order(
+            symbol="AAPL",
+            instrument_type="EQUITY",
+            order_side="SELL",
+            order_type="MARKET",
+            quantity="5",
+            open_close_indicator="CLOSE",
+            tax_lot_matching_instructions=self.INSTRUCTIONS,
+        )
+        req = mock_client.place_order.await_args.kwargs["order_request"]
+        assert req.tax_lot_matching_instructions is not None
+        assert len(req.tax_lot_matching_instructions) == 2
+        assert req.tax_lot_matching_instructions[0].tax_lot_id == "lot-1"
+        assert req.tax_lot_matching_instructions[0].quantity == "3"
+
+    async def test_place_order_omits_instructions_when_not_provided(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_result = MagicMock()
+        mock_result.order_id = "order-uuid"
+        mock_client.place_order = AsyncMock(return_value=mock_result)
+
+        await place_order(
+            symbol="AAPL",
+            instrument_type="EQUITY",
+            order_side="BUY",
+            order_type="MARKET",
+            quantity="5",
+        )
+        req = mock_client.place_order.await_args.kwargs["order_request"]
+        assert req.tax_lot_matching_instructions is None
+
+    async def test_preflight_order_passes_instructions_through(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_result = MagicMock()
+        mock_result.model_dump.return_value = {"estimated_cost": "0.00"}
+        mock_client.perform_preflight_calculation = AsyncMock(return_value=mock_result)
+
+        await preflight_order(
+            symbol="AAPL",
+            instrument_type="EQUITY",
+            order_side="SELL",
+            order_type="MARKET",
+            quantity="5",
+            open_close_indicator="CLOSE",
+            tax_lot_matching_instructions=self.INSTRUCTIONS,
+        )
+        req = mock_client.perform_preflight_calculation.await_args.kwargs["preflight_request"]
+        assert req.tax_lot_matching_instructions is not None
+        assert len(req.tax_lot_matching_instructions) == 2
+        assert req.tax_lot_matching_instructions[1].tax_lot_id == "lot-2"
