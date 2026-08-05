@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "publicdotcom-mcp-server"
-version = "0.5.0"
+version = "0.5.1"
 description = "MCP server for the Public.com Trading API"
 readme = "README.md"
 license = "Apache-2.0"
@@ -25,8 +25,8 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 dependencies = [
-    "mcp>=1.0.0",
-    "publicdotcom-py==0.1.19",
+    "mcp>=1.0.0,<2.0.0",
+    "publicdotcom-py==0.1.20",
     "starlette>=0.27.0",
     "uvicorn>=0.29.0",
 ]

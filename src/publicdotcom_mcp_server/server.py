@@ -862,7 +862,7 @@ async def get_tax_lots(account_id: str | None = None) -> str:
 
     Returns per-lot unrealized gain/loss, holding term (short/long/60-40),
     cost basis, and the aggregate totals across all lots. Requires the API
-    key to have the `portfolio` scope.
+    key to have the `trading.read` scope.
 
     Args:
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
@@ -894,7 +894,7 @@ async def get_tax_lots_for_symbol(
 
     Returns each open lot for the symbol with its unrealized gain/loss,
     holding term, and cost basis. Requires the API key to have the
-    `portfolio` scope.
+    `trading.read` scope.
 
     Args:
         symbol: Ticker symbol (e.g. "AAPL").
@@ -927,7 +927,7 @@ async def get_tax_lots_csv(account_id: str | None = None) -> str:
 
     Returns a file object with `fileName` and `base64Data`. The CSV contents
     are Base64-encoded in the `base64Data` field — decode it to recover the
-    raw CSV text. Requires the API key to have the `portfolio` scope.
+    raw CSV text. Requires the API key to have the `trading.read` scope.
 
     Args:
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
