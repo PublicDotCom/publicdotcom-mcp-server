@@ -24,6 +24,8 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_price_history` | OHLCV price history for equities, crypto, options, or indices |
 | `get_instrument` | Details about a specific tradeable instrument |
 | `get_all_instruments` | List all available instruments with filters |
+| `search_bonds` | Filtered, paged search for fixed income instruments |
+| `get_bond_details` | Pricing, ratings, coupon and maturity info for a bond |
 | `get_option_expirations` | Available expiration dates for options |
 | `get_option_chain` | Full option chain (calls + puts) for a symbol |
 | `get_option_greeks` | Greeks (delta, gamma, theta, vega, rho, IV) for multiple options |

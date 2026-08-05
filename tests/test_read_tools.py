@@ -8,6 +8,7 @@ from publicdotcom_mcp_server.server import (
     check_setup,
     get_accounts,
     get_all_instruments,
+    get_bond_details,
     get_history,
     get_instrument,
     get_option_chain,
@@ -22,6 +23,7 @@ from publicdotcom_mcp_server.server import (
     get_tax_lots,
     get_tax_lots_csv,
     get_tax_lots_for_symbol,
+    search_bonds,
 )
 
 
@@ -370,6 +372,79 @@ class TestGetAllInstruments:
 
         result = await get_all_instruments()
         assert "Error" in result
+
+
+class TestSearchBonds:
+    async def test_returns_page_without_filters(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.search_bonds = AsyncMock(
+            return_value=_make_model({"content": [], "totalElements": 0})
+        )
+
+        result = await search_bonds()
+        assert '"content"' in result
+        # no filters supplied -> no request object built
+        assert mock_client.search_bonds.call_args.kwargs["bond_search_request"] is None
+
+    async def test_filters_build_request(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.search_bonds = AsyncMock(
+            return_value=_make_model({"content": [], "totalElements": 0})
+        )
+
+        result = await search_bonds(
+            bond_type=["treasury"],
+            rating=["AA+"],
+            rating_category="investment_grade",
+            min_maturity_date="2027-01-15",
+            min_current_yield="4.0",
+            callable=False,
+            page_size=50,
+        )
+        assert "Error" not in result
+        req = mock_client.search_bonds.call_args.kwargs["bond_search_request"]
+        assert req is not None
+        assert [t.value for t in req.bond_type] == ["TREASURY"]
+        assert [r.value for r in req.rating] == ["AA+"]
+        assert req.rating_category.value == "INVESTMENT_GRADE"
+        assert str(req.min_maturity_date) == "2027-01-15"
+        assert req.callable is False
+        assert req.page_size == 50
+
+    async def test_invalid_bond_type_returns_error(self, patch_get_client):
+        result = await search_bonds(bond_type=["INVALID"])
+        assert "Error" in result
+
+    async def test_invalid_date_returns_error(self, patch_get_client):
+        result = await search_bonds(min_maturity_date="not-a-date")
+        assert "Error" in result
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.search_bonds = AsyncMock(side_effect=Exception("timeout"))
+
+        result = await search_bonds()
+        assert "Error" in result
+
+
+class TestGetBondDetails:
+    async def test_returns_serialized_details(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_bond_details = AsyncMock(
+            return_value=_make_model({"cusip": "912810TM0", "issuer": "US Treasury"})
+        )
+
+        result = await get_bond_details("912810TM0-BOND")
+        assert '"cusip"' in result
+        assert mock_client.get_bond_details.call_args.kwargs["symbol"] == "912810TM0-BOND"
+
+    async def test_api_error_returns_error_string(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_bond_details = AsyncMock(side_effect=Exception("not found"))
+
+        result = await get_bond_details("BAD-SYMBOL")
+        assert "Error" in result
+        assert "not found" in result
 
 
 class TestGetOptionExpirations:
