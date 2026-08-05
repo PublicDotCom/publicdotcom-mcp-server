@@ -443,6 +443,34 @@ class TestCancelAndReplaceOrder:
         assert data["status"] == "error"
         assert "expiration_time" in data["message"]
 
+    async def test_amount_replaces_for_notional_value(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_result = MagicMock()
+        mock_result.order_id = "new-order-uuid"
+        mock_client.cancel_and_replace_order = AsyncMock(return_value=mock_result)
+
+        result = await cancel_and_replace_order(
+            order_id="00000000-0000-4000-a000-000000000001",
+            order_type="MARKET",
+            amount="500.00",
+        )
+        data = json.loads(result)
+        assert data["status"] == "submitted"
+        req = mock_client.cancel_and_replace_order.call_args.kwargs["request"]
+        assert req.amount is not None
+        assert req.quantity is None
+
+    async def test_quantity_and_amount_mutually_exclusive(self, patch_get_client):
+        result = await cancel_and_replace_order(
+            order_id="00000000-0000-4000-a000-000000000001",
+            order_type="MARKET",
+            quantity="5",
+            amount="500.00",
+        )
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert "mutually exclusive" in data["message"]
+
 
 class TestTaxLotMatchingInstructions:
     """place_order/preflight_order forward the optional tax-lot selection."""

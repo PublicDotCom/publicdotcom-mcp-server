@@ -35,7 +35,12 @@ from public_api_sdk import (
     OrderInstrument,
 )
 from public_api_sdk.models import (
+    BondRating,
+    BondSearchRequest,
+    BondStatus,
+    BondType,
     CancelAndReplaceRequest,
+    CouponFrequency,
     EquityMarketSession,
     GatewayTaxLotMatchingInstruction,
     HistoryRequest,
@@ -53,11 +58,16 @@ from public_api_sdk.models import (
     OrderType,
     PreflightMultiLegRequest,
     PreflightRequest,
+    RatingCategory,
+    SortDirection,
+    SpCreditwatch,
+    SpOutlook,
     StrategyOrderLeg,
     StrategyQuoteRequest,
     TimeInForce,
     Trading,
     TradingSessionToggle,
+    TreasurySubtype,
 )
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -699,6 +709,190 @@ async def get_all_instruments(
             return _serialize(instruments)
     except Exception as e:
         logger.error("get_all_instruments failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Search Bonds",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def search_bonds(
+    page_number: int | None = None,
+    page_size: int | None = None,
+    sort_property: str | None = None,
+    sort_direction: str | None = None,
+    issuer: str | None = None,
+    issuer_symbol: list[str] | None = None,
+    bond_status: list[str] | None = None,
+    bond_type: list[str] | None = None,
+    treasury_subtype: list[str] | None = None,
+    rating: list[str] | None = None,
+    rating_category: str | None = None,
+    sp_outlook: list[str] | None = None,
+    sp_creditwatch: list[str] | None = None,
+    coupon_frequency: list[str] | None = None,
+    min_coupon: str | None = None,
+    max_coupon: str | None = None,
+    min_maturity_date: str | None = None,
+    max_maturity_date: str | None = None,
+    min_current_yield: str | None = None,
+    max_current_yield: str | None = None,
+    min_par_value: str | None = None,
+    max_par_value: str | None = None,
+    min_liquidity_rating: str | None = None,
+    max_liquidity_rating: str | None = None,
+    liquidity_rating: list[str] | None = None,
+    callable: bool | None = None,
+    perpetual: bool | None = None,
+    partial_par: bool | None = None,
+) -> str:
+    """
+    Filtered, paged search for fixed income (bond) instruments.
+
+    All filters are optional; combine them to narrow down results. Returns a
+    page object with `content` (the bonds), `totalElements`, and `totalPages`.
+
+    Args:
+        page_number: Page number, zero-based. Default 0.
+        page_size: Items per page. Default 20.
+        sort_property: Property to sort by (e.g. "maturityDate").
+        sort_direction: ASC or DESC. Default DESC.
+        issuer: Filter by issuer name.
+        issuer_symbol: Filter by issuer symbol(s), e.g. ["AAPL"].
+        bond_status: e.g. ["OUTSTANDING"]. Valid: LIQUIDATED, CONVERTED,
+            FUNGED, REPAID, RESTRUCTURED, CALLED, DEFAULTED, MATURED,
+            OUTSTANDING, PUT, TENDERED, REPURCHASED, PRE_ISSUANCE, UNKNOWN.
+        bond_type: e.g. ["TREASURY", "CORPORATE"]. Valid: AGENCY, CD,
+            CORPORATE, GOVERNMENT, MUNICIPAL, TREASURY.
+        treasury_subtype: Valid: BOND, BILL, NOTE, STRIPS, TIPS, FLOATING.
+        rating: S&P rating(s), e.g. ["AAA", "AA+"]. From AAA through D,
+            NR for not rated (short-term ratings like A-1+/SP-1 also valid).
+        rating_category: INVESTMENT_GRADE or SPECULATIVE_GRADE.
+        sp_outlook: Valid: POSITIVE, NEGATIVE, DEVELOPING, STABLE,
+            NOT_RATED, NOT_MEANINGFUL.
+        sp_creditwatch: Valid: POSITIVE, NEGATIVE, DEVELOPING, NOT_MEANINGFUL.
+        coupon_frequency: Valid: AT_MATURITY, ZERO, MONTHLY, QUARTERLY,
+            SEMI_ANNUAL, ANNUAL.
+        min_coupon: Minimum coupon rate (numeric string).
+        max_coupon: Maximum coupon rate (numeric string).
+        min_maturity_date: yyyy-MM-dd. Defaults server-side to today + 14 days.
+        max_maturity_date: yyyy-MM-dd.
+        min_current_yield: Minimum current yield (numeric string).
+        max_current_yield: Maximum current yield (numeric string).
+        min_par_value: Minimum par value (numeric string).
+        max_par_value: Maximum par value (numeric string).
+        min_liquidity_rating: Minimum liquidity score, 1 (low) to 5 (high).
+        max_liquidity_rating: Maximum liquidity score, 1 (low) to 5 (high).
+        liquidity_rating: Specific liquidity score(s), 1–5.
+        callable: Filter by callable status.
+        perpetual: Filter by perpetual bond status.
+        partial_par: Filter by partial par status.
+    """
+    from datetime import date as date_type
+
+    try:
+        req_kwargs: dict[str, Any] = {}
+        if page_number is not None:
+            req_kwargs["page_number"] = page_number
+        if page_size is not None:
+            req_kwargs["page_size"] = page_size
+        if sort_property is not None:
+            req_kwargs["sort_property"] = sort_property
+        if sort_direction is not None:
+            req_kwargs["sort_direction"] = SortDirection(sort_direction.upper())
+        if issuer is not None:
+            req_kwargs["issuer"] = issuer
+        if issuer_symbol:
+            req_kwargs["issuer_symbol"] = issuer_symbol
+        if bond_status:
+            req_kwargs["bond_status"] = [BondStatus(s.upper()) for s in bond_status]
+        if bond_type:
+            req_kwargs["bond_type"] = [BondType(t.upper()) for t in bond_type]
+        if treasury_subtype:
+            req_kwargs["treasury_subtype"] = [
+                TreasurySubtype(t.upper()) for t in treasury_subtype
+            ]
+        if rating:
+            req_kwargs["rating"] = [BondRating(r.upper()) for r in rating]
+        if rating_category is not None:
+            req_kwargs["rating_category"] = RatingCategory(rating_category.upper())
+        if sp_outlook:
+            req_kwargs["sp_outlook"] = [SpOutlook(o.upper()) for o in sp_outlook]
+        if sp_creditwatch:
+            req_kwargs["sp_creditwatch"] = [
+                SpCreditwatch(w.upper()) for w in sp_creditwatch
+            ]
+        if coupon_frequency:
+            req_kwargs["coupon_frequency"] = [
+                CouponFrequency(f.upper()) for f in coupon_frequency
+            ]
+        for decimal_field, raw in [
+            ("min_coupon", min_coupon),
+            ("max_coupon", max_coupon),
+            ("min_current_yield", min_current_yield),
+            ("max_current_yield", max_current_yield),
+            ("min_par_value", min_par_value),
+            ("max_par_value", max_par_value),
+            ("min_liquidity_rating", min_liquidity_rating),
+            ("max_liquidity_rating", max_liquidity_rating),
+        ]:
+            if raw is not None:
+                req_kwargs[decimal_field] = Decimal(raw)
+        if liquidity_rating:
+            req_kwargs["liquidity_rating"] = [Decimal(r) for r in liquidity_rating]
+        for date_field, raw in [
+            ("min_maturity_date", min_maturity_date),
+            ("max_maturity_date", max_maturity_date),
+        ]:
+            if raw is not None:
+                req_kwargs[date_field] = date_type.fromisoformat(raw)
+        if callable is not None:
+            req_kwargs["callable"] = callable
+        if perpetual is not None:
+            req_kwargs["perpetual"] = perpetual
+        if partial_par is not None:
+            req_kwargs["partial_par"] = partial_par
+
+        req = BondSearchRequest(**req_kwargs) if req_kwargs else None
+        async with _get_client() as client:
+            page = await client.search_bonds(bond_search_request=req)
+            return _serialize(page)
+    except Exception as e:
+        logger.error("search_bonds failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Bond Details",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_bond_details(symbol: str, account_id: str | None = None) -> str:
+    """
+    Get comprehensive details for a single bond.
+
+    Returns pricing, ratings, coupon schedule, maturity, and call information
+    for the bond identified by its symbol.
+
+    Args:
+        symbol: Bond symbol, typically CUSIP-BOND format (e.g. "912810TM0-BOND").
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    try:
+        async with _get_client(account_id) as client:
+            details = await client.get_bond_details(
+                symbol=symbol, account_id=account_id
+            )
+            return _serialize(details)
+    except Exception as e:
+        logger.error("get_bond_details failed (symbol=%s): %s", symbol, e, exc_info=True)
         return f"Error: {e}"
 
 
@@ -2272,6 +2466,7 @@ async def cancel_and_replace_order(
     order_type: str,
     time_in_force: str = "DAY",
     quantity: str | None = None,
+    amount: str | None = None,
     limit_price: str | None = None,
     stop_price: str | None = None,
     expiration_time: str | None = None,
@@ -2282,11 +2477,16 @@ async def cancel_and_replace_order(
 
     ⚠️ This modifies an existing order.
 
+    Supported for equity, option, and crypto quantity orders.
+
     Args:
         order_id: UUID of the existing order to cancel and replace.
         order_type: MARKET, LIMIT, STOP, or STOP_LIMIT for the replacement.
         time_in_force: DAY or GTD. Default is DAY.
-        quantity: New quantity for the replacement order.
+        quantity: New quantity for the replacement order. Mutually exclusive
+            with amount.
+        amount: New notional dollar amount for the replacement order.
+            Mutually exclusive with quantity.
         limit_price: New limit price (for LIMIT/STOP_LIMIT orders).
         stop_price: New stop price (for STOP/STOP_LIMIT orders).
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
@@ -2299,7 +2499,7 @@ async def cancel_and_replace_order(
     try:
         _validate_order_params(
             quantity=quantity,
-            amount=None,
+            amount=amount,
             order_type=order_type,
             limit_price=limit_price,
             stop_price=stop_price,
@@ -2319,6 +2519,8 @@ async def cancel_and_replace_order(
         }
         if quantity is not None:
             req_kwargs["quantity"] = Decimal(quantity)
+        if amount is not None:
+            req_kwargs["amount"] = Decimal(amount)
         if limit_price is not None:
             req_kwargs["limit_price"] = Decimal(limit_price)
         if stop_price is not None:
