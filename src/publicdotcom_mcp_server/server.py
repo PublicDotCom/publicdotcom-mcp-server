@@ -578,6 +578,7 @@ async def get_price_history(
     aggregation: Literal["ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"] | None = None,
     purchase_date: str | None = None,
     trading_session_toggle: Literal["REGULAR_HOURS", "REGULAR_AND_EXTENDED_HOURS", "ALL_SESSIONS"] | None = None,
+    ipo_date: str | None = None,
 ) -> str:
     """
     Get historical OHLCV price bars for a symbol over a time period.
@@ -603,6 +604,15 @@ async def get_price_history(
             returns a full midnight-to-midnight chart including the overnight
             ATS sessions, adding preMarketOvernight (00:00–04:00) and
             postMarketOvernight (20:00–24:00) to the response.
+        ipo_date: Optional IPO / first-trade date of the asset. Format
+            "YYYY-MM-DD". When the asset is younger than the requested period,
+            the server fetches a finer aggregation over the available post-IPO
+            history (so the chart isn't a straight diagonal) and adds a
+            `leadingFill` object to the response describing the flat lead-in
+            to draw for the pre-IPO portion (startTimestamp, endTimestamp,
+            value, count, includedInTotalExpectedBars). Omit for unchanged
+            behavior. Ignored for the DAY chart; leadingFill is also never
+            emitted for the ALL / SINCE_PURCHASE periods.
     """
     if period == "SINCE_PURCHASE" and not purchase_date:
         return json.dumps(
@@ -632,6 +642,7 @@ async def get_price_history(
                     if trading_session_toggle
                     else None
                 ),
+                ipo_date=ipo_date,
             )
             return _serialize(bars)
     except Exception as e:
