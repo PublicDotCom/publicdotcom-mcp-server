@@ -257,6 +257,82 @@ class TestGetPriceHistory:
         )
         assert mock_client.get_bars.await_args.kwargs["purchase_date"] == "2025-01-01"
 
+    async def test_ipo_date_passed_through(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_bars = AsyncMock(return_value=_make_model({"bars": []}))
+
+        await get_price_history(
+            symbol="RDDT", period="FIVE_YEARS", ipo_date="2024-03-21"
+        )
+        assert mock_client.get_bars.await_args.kwargs["ipo_date"] == "2024-03-21"
+
+    async def test_ipo_date_defaults_to_none(self, patch_get_client):
+        mock_client = patch_get_client
+        mock_client.get_bars = AsyncMock(return_value=_make_model({"bars": []}))
+
+        await get_price_history(symbol="AAPL", period="YEAR")
+        assert mock_client.get_bars.await_args.kwargs["ipo_date"] is None
+
+    async def test_leading_fill_present_in_serialized_output(self, patch_get_client):
+        # SDK 0.1.22's BarsResponse gained an optional leading_fill; confirm it
+        # flows through _serialize under its camelCase alias with no tool-side
+        # handling. Uses the real model rather than a mock so the test breaks
+        # if the SDK's serialization aliases ever change.
+        from public_api_sdk.models import BarsResponse
+
+        bars_response = BarsResponse.model_validate(
+            {
+                "symbol": "RDDT",
+                "period": "FIVE_YEARS",
+                "totalExpectedBars": 60,
+                "preMarket": {"expectedBars": 0, "bars": []},
+                "regularMarket": {"expectedBars": 60, "bars": []},
+                "afterMarket": {"expectedBars": 0, "bars": []},
+                "leadingFill": {
+                    "startTimestamp": "2021-08-11T00:00:00Z",
+                    "endTimestamp": "2024-03-21T00:00:00Z",
+                    "value": "34.00",
+                    "count": 31,
+                    "includedInTotalExpectedBars": False,
+                },
+            }
+        )
+        mock_client = patch_get_client
+        mock_client.get_bars = AsyncMock(return_value=bars_response)
+
+        result = await get_price_history(
+            symbol="RDDT", period="FIVE_YEARS", ipo_date="2024-03-21"
+        )
+        data = json.loads(result)
+        fill = data["leadingFill"]
+        assert fill["startTimestamp"] == "2021-08-11T00:00:00Z"
+        assert fill["endTimestamp"] == "2024-03-21T00:00:00Z"
+        assert fill["value"] == "34.00"
+        assert fill["count"] == 31
+        assert fill["includedInTotalExpectedBars"] is False
+
+    async def test_leading_fill_omitted_when_absent(self, patch_get_client):
+        # exclude_none serialization should drop leadingFill entirely when the
+        # SDK response doesn't carry one, keeping output unchanged for callers
+        # that never pass ipo_date.
+        from public_api_sdk.models import BarsResponse
+
+        bars_response = BarsResponse.model_validate(
+            {
+                "symbol": "AAPL",
+                "period": "YEAR",
+                "totalExpectedBars": 52,
+                "preMarket": {"expectedBars": 0, "bars": []},
+                "regularMarket": {"expectedBars": 52, "bars": []},
+                "afterMarket": {"expectedBars": 0, "bars": []},
+            }
+        )
+        mock_client = patch_get_client
+        mock_client.get_bars = AsyncMock(return_value=bars_response)
+
+        result = await get_price_history(symbol="AAPL", period="YEAR")
+        assert "leadingFill" not in json.loads(result)
+
     async def test_api_error_returns_error_string(self, patch_get_client):
         mock_client = patch_get_client
         mock_client.get_bars = AsyncMock(side_effect=Exception("upstream 500"))
