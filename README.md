@@ -17,7 +17,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `check_setup` | Verify API credentials and connectivity |
 | `get_accounts` | List all brokerage accounts |
 | `get_portfolio` | View positions, equity, buying power, open orders |
-| `get_orders` | List active/open orders |
+| `get_orders` | List active/open orders (bracket legs share a `bracketId`) |
 | `get_order` | Get status of a specific order |
 | `get_history` | Transaction history (trades, deposits, dividends, etc.) |
 | `get_quotes` | Real-time quotes for stocks, crypto, options |
@@ -46,7 +46,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 
 | Tool | Description |
 |------|-------------|
-| `place_order` | Place a single-leg order (stocks, crypto, options); optionally target specific tax lots via `tax_lot_matching_instructions` |
+| `place_order` | Place a single-leg order (stocks, crypto, options); optionally a bracket order via `order_class` + exit-leg prices, or target specific tax lots via `tax_lot_matching_instructions` |
 | `place_multileg_order` | Place multi-leg orders (spreads, straddles, etc.) |
 | `place_call_credit_spread` | Place a Bear Call Spread |
 | `place_call_debit_spread` | Place a Bull Call Spread |
@@ -56,6 +56,27 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `flatten_and_go_short` | Sell an existing long position then go short (experimental) |
 | `cancel_order` | Cancel an existing order |
 | `cancel_and_replace_order` | Atomically cancel and replace an order |
+
+### Bracket orders
+
+`place_order` places a bracket by setting `order_class` to `BRACKET`, `OCO` or `OTO`
+and supplying at least one exit leg:
+
+| Argument | Meaning |
+|------|-------------|
+| `order_class` | `SIMPLE` (default, standalone) or `BRACKET` / `OCO` / `OTO` |
+| `take_profit_limit_price` | Limit price of the take-profit leg |
+| `stop_loss_stop_price` | Stop price of the stop-loss leg |
+| `stop_loss_limit_price` | Optional — makes the stop-loss a `STOP_LIMIT` rather than a `STOP` |
+
+The exit legs are submitted automatically when the entry order fills, and every leg
+of the bracket — the entry included — reports the entry's order ID as its
+`bracketId`, so `get_orders` groups them.
+
+The API accepts brackets for `EQUITY` and `OPTION` only; they need a whole-share
+`quantity` (not `amount`), must use the `CORE` market session, and the entry
+`order_type` must be `LIMIT` or `MARKET` (`LIMIT` only for `OCO`). `preflight_order`
+validates the entry order only — it has no view of the exit legs.
 
 ## Prerequisites
 

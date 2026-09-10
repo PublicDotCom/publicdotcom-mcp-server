@@ -51,6 +51,7 @@ from public_api_sdk.models import (
     OpenCloseIndicator,
     OptionChainRequest,
     OptionExpirationsRequest,
+    OrderClass,
     OrderExpirationRequest,
     OrderLegRequest,
     OrderRequest,
@@ -62,8 +63,10 @@ from public_api_sdk.models import (
     SortDirection,
     SpCreditwatch,
     SpOutlook,
+    StopLoss,
     StrategyOrderLeg,
     StrategyQuoteRequest,
+    TakeProfit,
     TimeInForce,
     Trading,
     TradingSessionToggle,
@@ -284,6 +287,59 @@ def _validate_order_params(
                 raise ValueError(f"{field_name} must be a numeric string, got: {raw_value!r}") from None
 
 
+def _build_bracket_kwargs(
+    *,
+    order_class: str | None,
+    take_profit_limit_price: str | None,
+    stop_loss_stop_price: str | None,
+    stop_loss_limit_price: str | None,
+) -> dict[str, Any]:
+    """Validate the bracket arguments and build the OrderRequest kwargs they map to.
+
+    Only the coherence of the arguments themselves is checked here — that the class
+    parses, that the prices are numeric, and that a stop-loss limit has a stop to
+    attach to. Which class needs which exit leg, and the instrument / quantity /
+    session / entry-type rules, are left to OrderRequest so the two layers cannot
+    disagree about what the API accepts.
+    """
+    for field_name, raw_value in [
+        ("take_profit_limit_price", take_profit_limit_price),
+        ("stop_loss_stop_price", stop_loss_stop_price),
+        ("stop_loss_limit_price", stop_loss_limit_price),
+    ]:
+        if raw_value is not None:
+            try:
+                Decimal(raw_value)
+            except Exception:
+                raise ValueError(
+                    f"{field_name} must be a numeric string, got: {raw_value!r}"
+                ) from None
+
+    if stop_loss_limit_price is not None and stop_loss_stop_price is None:
+        raise ValueError(
+            "stop_loss_limit_price requires stop_loss_stop_price — the limit price "
+            "only makes the stop-loss a STOP_LIMIT order, it cannot stand alone"
+        )
+
+    kwargs: dict[str, Any] = {}
+    if order_class:
+        try:
+            kwargs["order_class"] = OrderClass(order_class.upper())
+        except ValueError:
+            valid = ", ".join(c.value for c in OrderClass)
+            raise ValueError(
+                f"Invalid order_class: {order_class!r}. Expected one of: {valid}"
+            ) from None
+    if take_profit_limit_price is not None:
+        kwargs["take_profit"] = TakeProfit(limit_price=Decimal(take_profit_limit_price))
+    if stop_loss_stop_price is not None:
+        stop_loss_kwargs: dict[str, Any] = {"stop_price": Decimal(stop_loss_stop_price)}
+        if stop_loss_limit_price is not None:
+            stop_loss_kwargs["limit_price"] = Decimal(stop_loss_limit_price)
+        kwargs["stop_loss"] = StopLoss(**stop_loss_kwargs)
+    return kwargs
+
+
 # ========================================================================
 # READ-ONLY TOOLS
 # ========================================================================
@@ -395,6 +451,9 @@ async def get_orders(account_id: str | None = None) -> str:
     Returns order details including symbol, side, type, status, quantity,
     and prices.
 
+    Orders that belong to a bracket carry a bracketId — the order ID of the
+    bracket's entry order — which groups the entry and its exit legs together.
+
     Args:
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
@@ -422,6 +481,9 @@ async def get_order(order_id: str, account_id: str | None = None) -> str:
 
     Note: Order placement is asynchronous. This may return an error if
     the order has not yet been indexed.
+
+    An order that belongs to a bracket carries a bracketId — the order ID of the
+    bracket's entry order. Pass that ID to get_orders to find the sibling legs.
 
     Args:
         order_id: The UUID of the order to look up.
@@ -1712,6 +1774,10 @@ async def place_order(
     expiration_time: str | None = None,
     equity_market_session: str | None = None,
     tax_lot_matching_instructions: list[dict] | None = None,
+    order_class: str | None = None,
+    take_profit_limit_price: str | None = None,
+    stop_loss_stop_price: str | None = None,
+    stop_loss_limit_price: str | None = None,
     account_id: str | None = None,
 ) -> str:
     """
@@ -1740,6 +1806,23 @@ async def place_order(
             the quantities must sum to the order quantity; and the account's
             tax-lot information must have been updated today. Omit to let the
             broker apply its default lot-matching.
+        order_class: SIMPLE (default) places a standalone order. BRACKET, OCO or
+            OTO place a bracket order, where the exit legs below are submitted
+            automatically once this entry order fills. Bracket orders are for
+            EQUITY and OPTION only, need a whole-share quantity (not amount),
+            must use the CORE market session, and the entry order_type must be
+            LIMIT or MARKET — LIMIT only for OCO. Every leg of the bracket,
+            entry included, reports the entry's order ID as its bracketId.
+            preflight_order cannot check the exit legs — it validates the entry
+            order only.
+        take_profit_limit_price: Limit price of the take-profit exit leg, placed
+            on the opposite side of the entry. Requires a bracket order_class.
+        stop_loss_stop_price: Stop price of the stop-loss exit leg, placed on the
+            opposite side of the entry. Requires a bracket order_class. Placed as
+            a STOP order unless stop_loss_limit_price is given too.
+        stop_loss_limit_price: Limit price that makes the stop-loss leg a
+            STOP_LIMIT order instead of a STOP order. Requires
+            stop_loss_stop_price.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
     from datetime import datetime as dt
@@ -1792,11 +1875,19 @@ async def place_order(
             req_kwargs["tax_lot_matching_instructions"] = [
                 GatewayTaxLotMatchingInstruction(**d) for d in tax_lot_matching_instructions
             ]
+        req_kwargs.update(
+            _build_bracket_kwargs(
+                order_class=order_class,
+                take_profit_limit_price=take_profit_limit_price,
+                stop_loss_stop_price=stop_loss_stop_price,
+                stop_loss_limit_price=stop_loss_limit_price,
+            )
+        )
 
         req = OrderRequest(**req_kwargs)
         logger.info(
-            "Placing order: order_id=%s symbol=%s side=%s type=%s qty=%s amount=%s",
-            order_id, symbol, order_side, order_type, quantity, amount,
+            "Placing order: order_id=%s symbol=%s side=%s type=%s qty=%s amount=%s class=%s",
+            order_id, symbol, order_side, order_type, quantity, amount, order_class,
         )
         async with _get_client(account_id) as client:
             new_order = await client.place_order(
