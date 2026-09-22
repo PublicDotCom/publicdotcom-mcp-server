@@ -55,7 +55,9 @@ from public_api_sdk.models import (
     OrderExpirationRequest,
     OrderLegRequest,
     OrderRequest,
+    OrderSearchRequest,
     OrderSide,
+    OrderStatus,
     OrderType,
     PreflightMultiLegRequest,
     PreflightRequest,
@@ -97,7 +99,7 @@ mcp = FastMCP(
     "Public.com",
     instructions=(
         "MCP server for the Public.com Trading API. Provides tools to view "
-        "portfolio, get quotes, place/cancel orders, view history, look up "
+        "portfolio, get quotes, place/cancel orders, search order history, look up "
         "instruments, and work with options — all through a Public.com "
         "brokerage account. Requires a PUBLIC_COM_SECRET environment variable."
     ),
@@ -340,6 +342,82 @@ def _build_bracket_kwargs(
     return kwargs
 
 
+def _parse_timestamp(field_name: str, raw: str):
+    """Parse an ISO 8601 timestamp, accepting a trailing 'Z' on every supported Python."""
+    from datetime import datetime as dt
+
+    normalized = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+    try:
+        return dt.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError(
+            f"{field_name} must be an ISO 8601 timestamp (e.g. 2026-09-01T00:00:00Z), got: {raw!r}"
+        ) from None
+
+
+def _parse_symbol_spec(spec: str) -> OrderInstrument:
+    """Parse "SYMBOL" or "SYMBOL:TYPE" (type defaults to EQUITY) into an OrderInstrument."""
+    symbol, sep, type_str = spec.partition(":")
+    symbol = symbol.strip()
+    if not symbol or (sep and not type_str.strip()) or ":" in type_str:
+        raise ValueError(
+            f"Invalid symbol spec {spec!r}. Expected 'SYMBOL' or 'SYMBOL:TYPE', "
+            "e.g. 'AAPL' or 'SPY260313P00670000:OPTION'"
+        )
+    itype = _parse_instrument_type(type_str.strip()) if sep else InstrumentType.EQUITY
+    return OrderInstrument(symbol=symbol, type=itype)
+
+
+def _build_order_search_request(
+    *,
+    status: str | None,
+    side: str | None,
+    symbols: list[str] | None,
+    security_type: str | None,
+    open_close_indicator: str | None,
+    created_after: str | None,
+    created_before: str | None,
+) -> OrderSearchRequest | None:
+    """Parse the search_orders arguments into the SDK's OrderSearchRequest.
+
+    Only the coherence of the arguments themselves is checked here — that each enum
+    value parses, that symbol specs are well-formed and that the timestamps are
+    ISO 8601. The 30-day window and the 500-order cap are enforced by the API, and
+    the field semantics live in OrderSearchRequest, so the layers cannot disagree.
+    Returns None when no filter was given, so the SDK sends its empty request.
+    """
+    req_kwargs: dict[str, Any] = {}
+    if status is not None:
+        # OrderStatus(...) never raises — it falls back to UNKNOWN for values the
+        # SDK does not recognise — so match on the real API values explicitly.
+        api_statuses = {s.value: s for s in OrderStatus if s is not OrderStatus.UNKNOWN}
+        parsed_status = api_statuses.get(status.upper())
+        if parsed_status is None:
+            valid = ", ".join(api_statuses)
+            raise ValueError(f"Invalid status: {status!r}. Expected one of: {valid}")
+        req_kwargs["status"] = parsed_status
+    if side is not None:
+        try:
+            req_kwargs["side"] = OrderSide(side.upper())
+        except ValueError:
+            raise ValueError(f"Invalid side: {side!r}. Expected BUY or SELL") from None
+    if symbols:
+        req_kwargs["instruments"] = [_parse_symbol_spec(spec) for spec in symbols]
+    if security_type is not None:
+        req_kwargs["security_type"] = _parse_instrument_type(security_type)
+    if open_close_indicator is not None:
+        try:
+            req_kwargs["open_close_indicator"] = OpenCloseIndicator(open_close_indicator.upper())
+        except ValueError:
+            raise ValueError(
+                f"Invalid open_close_indicator: {open_close_indicator!r}. Expected OPEN or CLOSE"
+            ) from None
+    for field_name, raw in [("created_after", created_after), ("created_before", created_before)]:
+        if raw is not None:
+            req_kwargs[field_name] = _parse_timestamp(field_name, raw)
+    return OrderSearchRequest(**req_kwargs) if req_kwargs else None
+
+
 # ========================================================================
 # READ-ONLY TOOLS
 # ========================================================================
@@ -495,6 +573,113 @@ async def get_order(order_id: str, account_id: str | None = None) -> str:
             return _serialize(order)
     except Exception as e:
         logger.error("get_order failed (order_id=%s): %s", order_id, e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Search Orders",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def search_orders(
+    account_id: str | None = None,
+    status: str | None = None,
+    side: str | None = None,
+    symbols: list[str] | None = None,
+    security_type: str | None = None,
+    open_close_indicator: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+) -> str:
+    """
+    Search the account's order history — orders in ANY status, created in the last 30 days.
+
+    This is the order-history tool. It differs from get_orders, which returns only
+    the open/active orders embedded in the portfolio snapshot: search_orders queries
+    the order-history endpoint and also returns filled, cancelled, rejected, expired
+    and replaced orders, narrowed by the filters below. All filters are optional and
+    combine with AND; call it with no filters to list every order in the window.
+
+    Limits (enforced by the API): only orders created within the last 30 days are
+    searchable, and at most 500 orders are returned — narrow with created_after /
+    created_before or the other filters if a search could exceed that.
+
+    Each result uses the v2 order shape: everything get_order returns plus `trades`
+    (the individual fills: tradeId, quantity, price, side, timestamp), `filledAt`,
+    `replacedAt`, `lastModified` and `equityMarketSession`. `equityMarketSession`
+    reports the session an equity order was placed for as REGULAR, REST_OF_DAY or
+    TWENTY_FOUR_HOURS — a different vocabulary from place_order's
+    `equity_market_session` argument (CORE / EXTENDED / TWENTY_FOUR_HOURS); never
+    feed one into the other.
+
+    Args:
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+        status: Only orders currently in this status. One of NEW, PARTIALLY_FILLED,
+            FILLED, CANCELLED, QUEUED_CANCELLED, PENDING_CANCEL, PENDING_REPLACE,
+            REPLACED, REJECTED, EXPIRED.
+        side: BUY or SELL.
+        symbols: Only orders for these instruments, each as "SYMBOL" or "SYMBOL:TYPE"
+            (type defaults to EQUITY), e.g. ["AAPL", "BTC:CRYPTO",
+            "SPY260313P00670000:OPTION"].
+        security_type: Only orders of this instrument type. One of EQUITY, OPTION,
+            MULTI_LEG_INSTRUMENT, CRYPTO, ALT, TREASURY, BOND, INDEX.
+        open_close_indicator: OPEN or CLOSE (set on option and shorting orders only).
+        created_after: Only orders created at or after this ISO 8601 timestamp
+            (e.g. 2026-09-01T00:00:00Z). Cannot reach back more than 30 days.
+        created_before: Only orders created before this ISO 8601 timestamp.
+    """
+    try:
+        req = _build_order_search_request(
+            status=status,
+            side=side,
+            symbols=symbols,
+            security_type=security_type,
+            open_close_indicator=open_close_indicator,
+            created_after=created_after,
+            created_before=created_before,
+        )
+        async with _get_client(account_id) as client:
+            orders = await client.search_orders(order_search_request=req, account_id=account_id)
+            return _serialize(orders)
+    except Exception as e:
+        logger.error("search_orders failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Order (v2)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_order_v2(order_id: str, account_id: str | None = None) -> str:
+    """
+    Get a specific order in the v2 shape — everything get_order returns, plus its fills.
+
+    Adds `trades` (each fill's tradeId, quantity, price, side and timestamp),
+    `filledAt`, `replacedAt`, `lastModified` and `equityMarketSession` (REGULAR /
+    REST_OF_DAY / TWENTY_FOUR_HOURS — not place_order's session vocabulary). Prefer
+    this over get_order when execution details such as fill prices or times matter.
+
+    Only orders created within the last 30 days are available here; use get_order
+    for anything older. Like get_order, it may return an error for an order that was
+    just placed and has not yet been indexed.
+
+    Args:
+        order_id: The UUID of the order to look up.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    try:
+        async with _get_client(account_id) as client:
+            order = await client.get_order_v2(order_id=order_id, account_id=account_id)
+            return _serialize(order)
+    except Exception as e:
+        logger.error("get_order_v2 failed (order_id=%s): %s", order_id, e, exc_info=True)
         return f"Error: {e}"
 
 

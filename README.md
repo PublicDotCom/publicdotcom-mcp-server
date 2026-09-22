@@ -19,6 +19,8 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_portfolio` | View positions, equity, buying power, open orders |
 | `get_orders` | List active/open orders (bracket legs share a `bracketId`) |
 | `get_order` | Get status of a specific order |
+| `search_orders` | Search order history — any status, last 30 days, up to 500 orders, filtered by status/side/symbols/type/time |
+| `get_order_v2` | Order details plus its fills (`trades`, `filledAt`, `replacedAt`, `lastModified`); last 30 days |
 | `get_history` | Transaction history (trades, deposits, dividends, etc.) |
 | `get_quotes` | Real-time quotes for stocks, crypto, options |
 | `get_price_history` | OHLCV price history for equities, crypto, options, or indices |
@@ -77,6 +79,23 @@ The API accepts brackets for `EQUITY` and `OPTION` only; they need a whole-share
 `quantity` (not `amount`), must use the `CORE` market session, and the entry
 `order_type` must be `LIMIT` or `MARKET` (`LIMIT` only for `OCO`). `preflight_order`
 validates the entry order only — it has no view of the exit legs.
+
+### Order history
+
+`get_orders` lists only the open/active orders in the portfolio snapshot. For everything
+else use the v2 order tools, which query the order-history endpoint:
+
+| Tool | Returns |
+|------|-------------|
+| `search_orders` | Orders in any status (filled, cancelled, rejected, …) matching optional `status`, `side`, `symbols` (`"SYMBOL"` or `"SYMBOL:TYPE"`), `security_type`, `open_close_indicator`, `created_after` / `created_before` filters |
+| `get_order_v2` | One order by ID in the same v2 shape |
+
+Both are limited by the API to orders created within the **last 30 days**, and
+`search_orders` returns at most **500** orders. The v2 shape adds `trades` (the
+individual fills), `filledAt`, `replacedAt`, `lastModified` and `equityMarketSession`.
+Note that `equityMarketSession` uses `REGULAR` / `REST_OF_DAY` / `TWENTY_FOUR_HOURS`,
+which is not the `CORE` / `EXTENDED` / `TWENTY_FOUR_HOURS` vocabulary that
+`place_order`'s `equity_market_session` argument takes.
 
 ## Prerequisites
 
