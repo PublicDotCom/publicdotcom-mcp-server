@@ -62,6 +62,25 @@ class TestGetAccounts:
         assert "PUBLIC_COM_SECRET" in result
 
 
+    async def test_joint_and_entity_accounts_are_listed(self, patch_get_client):
+        from public_api_sdk.models import AccountsResponse
+
+        mock_client = patch_get_client
+        mock_client.get_accounts = AsyncMock(
+            return_value=AccountsResponse.model_validate(
+                {
+                    "accounts": [
+                        {"accountId": "acct-joint", "accountType": "JOINT"},
+                        {"accountId": "acct-entity", "accountType": "ENTITY"},
+                    ]
+                }
+            )
+        )
+
+        data = json.loads(await get_accounts())
+        assert [a["accountType"] for a in data["accounts"]] == ["JOINT", "ENTITY"]
+
+
 class TestGetPortfolio:
     async def test_returns_serialized_portfolio(self, patch_get_client):
         mock_client = patch_get_client

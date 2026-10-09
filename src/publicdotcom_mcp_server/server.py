@@ -42,6 +42,11 @@ from public_api_sdk.models import (
     CancelAndReplaceRequest,
     CouponFrequency,
     EquityMarketSession,
+    EventContractBarPeriod,
+    EventFrequency,
+    EventSortingMode,
+    EventSummaryFilters,
+    EventSummaryRequest,
     GatewayTaxLotMatchingInstruction,
     HistoryRequest,
     InstrumentsRequest,
@@ -55,7 +60,9 @@ from public_api_sdk.models import (
     OrderExpirationRequest,
     OrderLegRequest,
     OrderRequest,
+    OrderSearchRequest,
     OrderSide,
+    OrderStatus,
     OrderType,
     PreflightMultiLegRequest,
     PreflightRequest,
@@ -97,8 +104,9 @@ mcp = FastMCP(
     "Public.com",
     instructions=(
         "MCP server for the Public.com Trading API. Provides tools to view "
-        "portfolio, get quotes, place/cancel orders, view history, look up "
-        "instruments, and work with options — all through a Public.com "
+        "portfolio, get quotes, place/cancel orders, search order history, look up "
+        "instruments, work with options, and browse event contracts (prediction "
+        "markets) — all through a Public.com "
         "brokerage account. Requires a PUBLIC_COM_SECRET environment variable."
     ),
 )
@@ -340,6 +348,82 @@ def _build_bracket_kwargs(
     return kwargs
 
 
+def _parse_timestamp(field_name: str, raw: str):
+    """Parse an ISO 8601 timestamp, accepting a trailing 'Z' on every supported Python."""
+    from datetime import datetime as dt
+
+    normalized = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+    try:
+        return dt.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError(
+            f"{field_name} must be an ISO 8601 timestamp (e.g. 2026-09-01T00:00:00Z), got: {raw!r}"
+        ) from None
+
+
+def _parse_symbol_spec(spec: str) -> OrderInstrument:
+    """Parse "SYMBOL" or "SYMBOL:TYPE" (type defaults to EQUITY) into an OrderInstrument."""
+    symbol, sep, type_str = spec.partition(":")
+    symbol = symbol.strip()
+    if not symbol or (sep and not type_str.strip()) or ":" in type_str:
+        raise ValueError(
+            f"Invalid symbol spec {spec!r}. Expected 'SYMBOL' or 'SYMBOL:TYPE', "
+            "e.g. 'AAPL' or 'SPY260313P00670000:OPTION'"
+        )
+    itype = _parse_instrument_type(type_str.strip()) if sep else InstrumentType.EQUITY
+    return OrderInstrument(symbol=symbol, type=itype)
+
+
+def _build_order_search_request(
+    *,
+    status: str | None,
+    side: str | None,
+    symbols: list[str] | None,
+    security_type: str | None,
+    open_close_indicator: str | None,
+    created_after: str | None,
+    created_before: str | None,
+) -> OrderSearchRequest | None:
+    """Parse the search_orders arguments into the SDK's OrderSearchRequest.
+
+    Only the coherence of the arguments themselves is checked here — that each enum
+    value parses, that symbol specs are well-formed and that the timestamps are
+    ISO 8601. The 30-day window and the 500-order cap are enforced by the API, and
+    the field semantics live in OrderSearchRequest, so the layers cannot disagree.
+    Returns None when no filter was given, so the SDK sends its empty request.
+    """
+    req_kwargs: dict[str, Any] = {}
+    if status is not None:
+        # OrderStatus(...) never raises — it falls back to UNKNOWN for values the
+        # SDK does not recognise — so match on the real API values explicitly.
+        api_statuses = {s.value: s for s in OrderStatus if s is not OrderStatus.UNKNOWN}
+        parsed_status = api_statuses.get(status.upper())
+        if parsed_status is None:
+            valid = ", ".join(api_statuses)
+            raise ValueError(f"Invalid status: {status!r}. Expected one of: {valid}")
+        req_kwargs["status"] = parsed_status
+    if side is not None:
+        try:
+            req_kwargs["side"] = OrderSide(side.upper())
+        except ValueError:
+            raise ValueError(f"Invalid side: {side!r}. Expected BUY or SELL") from None
+    if symbols:
+        req_kwargs["instruments"] = [_parse_symbol_spec(spec) for spec in symbols]
+    if security_type is not None:
+        req_kwargs["security_type"] = _parse_instrument_type(security_type)
+    if open_close_indicator is not None:
+        try:
+            req_kwargs["open_close_indicator"] = OpenCloseIndicator(open_close_indicator.upper())
+        except ValueError:
+            raise ValueError(
+                f"Invalid open_close_indicator: {open_close_indicator!r}. Expected OPEN or CLOSE"
+            ) from None
+    for field_name, raw in [("created_after", created_after), ("created_before", created_before)]:
+        if raw is not None:
+            req_kwargs[field_name] = _parse_timestamp(field_name, raw)
+    return OrderSearchRequest(**req_kwargs) if req_kwargs else None
+
+
 # ========================================================================
 # READ-ONLY TOOLS
 # ========================================================================
@@ -477,10 +561,19 @@ async def get_orders(account_id: str | None = None) -> str:
 )
 async def get_order(order_id: str, account_id: str | None = None) -> str:
     """
-    Get the status and details of a specific order.
+    Get the status and details of a specific order, including its fills.
 
-    Note: Order placement is asynchronous. This may return an error if
-    the order has not yet been indexed.
+    Returns the order with `trades` (each fill's tradeId, quantity, price, side
+    and timestamp), `filledAt`, `replacedAt`, `lastModified` and
+    `equityMarketSession`. `equityMarketSession` reports the session as REGULAR,
+    REST_OF_DAY or TWENTY_FOUR_HOURS — a different vocabulary from place_order's
+    `equity_market_session` argument (CORE / EXTENDED / TWENTY_FOUR_HOURS); never
+    feed one into the other.
+
+    Only orders created within the last 30 days can be looked up; older orders
+    return a not-found error. Order placement is asynchronous, so this may also
+    return an error for an order that was just placed and has not yet been
+    indexed.
 
     An order that belongs to a bracket carries a bracketId — the order ID of the
     bracket's entry order. Pass that ID to get_orders to find the sibling legs.
@@ -495,6 +588,79 @@ async def get_order(order_id: str, account_id: str | None = None) -> str:
             return _serialize(order)
     except Exception as e:
         logger.error("get_order failed (order_id=%s): %s", order_id, e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Search Orders",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def search_orders(
+    account_id: str | None = None,
+    status: str | None = None,
+    side: str | None = None,
+    symbols: list[str] | None = None,
+    security_type: str | None = None,
+    open_close_indicator: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+) -> str:
+    """
+    Search the account's order history — orders in ANY status, created in the last 30 days.
+
+    This is the order-history tool. It differs from get_orders, which returns only
+    the open/active orders embedded in the portfolio snapshot: search_orders queries
+    the order-history endpoint and also returns filled, cancelled, rejected, expired
+    and replaced orders, narrowed by the filters below. All filters are optional and
+    combine with AND; call it with no filters to list every order in the window.
+
+    Limits (enforced by the API): only orders created within the last 30 days are
+    searchable, and at most 500 orders are returned — narrow with created_after /
+    created_before or the other filters if a search could exceed that.
+
+    Each result has the same shape as get_order: the order plus `trades` (the
+    individual fills: tradeId, quantity, price, side, timestamp), `filledAt`,
+    `replacedAt`, `lastModified` and `equityMarketSession`. `equityMarketSession`
+    reports the session an equity order was placed for as REGULAR, REST_OF_DAY or
+    TWENTY_FOUR_HOURS — a different vocabulary from place_order's
+    `equity_market_session` argument (CORE / EXTENDED / TWENTY_FOUR_HOURS); never
+    feed one into the other.
+
+    Args:
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+        status: Only orders currently in this status. One of NEW, PARTIALLY_FILLED,
+            FILLED, CANCELLED, QUEUED_CANCELLED, PENDING_CANCEL, PENDING_REPLACE,
+            REPLACED, REJECTED, EXPIRED.
+        side: BUY or SELL.
+        symbols: Only orders for these instruments, each as "SYMBOL" or "SYMBOL:TYPE"
+            (type defaults to EQUITY), e.g. ["AAPL", "BTC:CRYPTO",
+            "SPY260313P00670000:OPTION"].
+        security_type: Only orders of this instrument type. One of EQUITY, OPTION,
+            MULTI_LEG_INSTRUMENT, CRYPTO, ALT, TREASURY, BOND, INDEX, EVENTCONTRACT.
+        open_close_indicator: OPEN or CLOSE (set on option and shorting orders only).
+        created_after: Only orders created at or after this ISO 8601 timestamp
+            (e.g. 2026-09-01T00:00:00Z). Cannot reach back more than 30 days.
+        created_before: Only orders created before this ISO 8601 timestamp.
+    """
+    try:
+        req = _build_order_search_request(
+            status=status,
+            side=side,
+            symbols=symbols,
+            security_type=security_type,
+            open_close_indicator=open_close_indicator,
+            created_after=created_after,
+            created_before=created_before,
+        )
+        async with _get_client(account_id) as client:
+            orders = await client.search_orders(order_search_request=req, account_id=account_id)
+            return _serialize(orders)
+    except Exception as e:
+        logger.error("search_orders failed: %s", e, exc_info=True)
         return f"Error: {e}"
 
 
@@ -572,7 +738,7 @@ async def get_quotes(
     Args:
         symbols: List of ticker symbols (e.g. ["AAPL", "GOOGL"]).
         instrument_type: Type for all symbols. One of EQUITY, CRYPTO, OPTION,
-            INDEX, ALT, BOND, TREASURY. Default is EQUITY. For mixed types,
+            INDEX, ALT, BOND, TREASURY, EVENTCONTRACT. Default is EQUITY. For mixed types,
             call this tool multiple times.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
@@ -636,7 +802,7 @@ async def get_price_history(
         "DAY", "WEEK", "MONTH", "QUARTER", "HALF_YEAR", "YEAR",
         "FIVE_YEARS", "TEN_YEARS", "ALL", "YTD", "SINCE_PURCHASE",
     ],
-    instrument_type: Literal["EQUITY", "CRYPTO", "OPTION", "INDEX"] = "EQUITY",
+    instrument_type: Literal["EQUITY", "CRYPTO", "OPTION", "INDEX", "EVENTCONTRACT"] = "EQUITY",
     aggregation: Literal["ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH", "THREE_MONTHS", "SIX_MONTHS", "ONE_YEAR"] | None = None,
     purchase_date: str | None = None,
     trading_session_toggle: Literal["REGULAR_HOURS", "REGULAR_AND_EXTENDED_HOURS", "ALL_SESSIONS"] | None = None,
@@ -653,7 +819,9 @@ async def get_price_history(
     Args:
         symbol: Ticker symbol (e.g. "AAPL").
         period: Time window to retrieve (e.g. "YEAR", "TEN_YEARS", "ALL").
-        instrument_type: EQUITY, CRYPTO, OPTION, or INDEX. Default EQUITY.
+        instrument_type: EQUITY, CRYPTO, OPTION, INDEX, or EVENTCONTRACT.
+            Default EQUITY. To chart several contracts of one event side by
+            side, get_event_contract_bars is usually the better fit.
         aggregation: Optional bar size. Prefer omitting it — the server then
             picks an appropriate size for the period. Only a subset of sizes
             is valid per period (finer/coarser sizes are rejected); if you set
@@ -730,7 +898,7 @@ async def get_instrument(symbol: str, instrument_type: str = "EQUITY") -> str:
     Args:
         symbol: Ticker symbol (e.g. "AAPL").
         instrument_type: One of EQUITY, CRYPTO, OPTION, INDEX, ALT, BOND,
-            TREASURY. Default is EQUITY.
+            TREASURY, EVENTCONTRACT. Default is EQUITY.
     """
     try:
         itype = _parse_instrument_type(instrument_type)
@@ -762,7 +930,8 @@ async def get_all_instruments(
 
     Args:
         type_filter: Filter by instrument types (e.g. ["EQUITY", "CRYPTO"]).
-            Valid: EQUITY, CRYPTO, OPTION, ALT, BOND, INDEX, TREASURY.
+            Valid: EQUITY, CRYPTO, OPTION, ALT, BOND, INDEX, TREASURY,
+            EVENTCONTRACT.
         trading_filter: Filter by trading status (e.g. ["BUY_AND_SELL"]).
             Valid: BUY_AND_SELL, LIQUIDATION_ONLY, DISABLED.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
@@ -1265,6 +1434,274 @@ async def get_strategy_quote(
             return _serialize(result)
     except Exception as e:
         logger.error("get_strategy_quote failed (base_symbol=%s): %s", base_symbol, e, exc_info=True)
+        return f"Error: {e}"
+
+
+# ========================================================================
+# EVENT CONTRACTS (prediction markets) — READ-ONLY
+# ========================================================================
+
+# Event contracts use two identifier families, and the endpoints are strict about
+# which one they take:
+#   - discovery (get_event_summary / get_event_details): the event's eventSymbol,
+#     e.g. "KALSHI.KXBALANCESHEET-EO26", and contract symbols such as
+#     "KALSHI.KXBALANCESHEET-EO26-6.6.Y";
+#   - charting (get_event_contract_bars): the "-EVENT" grouping id, e.g.
+#     "KALSHI.KXBALANCESHEET-EO26-EVENT", and "-EVENTCONTRACT" symbols, e.g.
+#     "KALSHI.KXBALANCESHEET-EO26-6.6.Y-EVENTCONTRACT".
+
+
+def _build_event_summary_request(
+    *,
+    sorting_mode: str,
+    category: str | None,
+    subcategory: str | None,
+    event_symbols: list[str] | None,
+    frequencies: list[str] | None,
+    resolution_time_start: str | None,
+    resolution_time_end: str | None,
+    display_resolved_events: bool | None,
+    created_within_days: int | None,
+    next_token: str | None,
+) -> EventSummaryRequest:
+    """Parse the get_event_summary arguments into the SDK's EventSummaryRequest.
+
+    The filters block is only sent when a filter argument is given. The API requires
+    both of its lists whenever the block is present, so an omitted list is sent as
+    eventSymbols=[] / frequencies=["ALL"] — the same defaults the CLI uses.
+    """
+    try:
+        mode = EventSortingMode(sorting_mode.upper())
+    except ValueError:
+        valid = ", ".join(m.value for m in EventSortingMode)
+        raise ValueError(
+            f"Invalid sorting_mode: {sorting_mode!r}. Expected one of: {valid}"
+        ) from None
+
+    req_kwargs: dict[str, Any] = {"sorting_mode": mode}
+    for field_name, value in [
+        ("category", category),
+        ("subcategory", subcategory),
+        ("next_token", next_token),
+        ("display_resolved_events", display_resolved_events),
+        ("created_within_days", created_within_days),
+    ]:
+        if value is not None:
+            req_kwargs[field_name] = value
+
+    symbols = [
+        part.strip().upper() for value in event_symbols or [] for part in value.split(",")
+    ]
+    symbols = [symbol for symbol in symbols if symbol]
+    # EventFrequency(...) never raises — it falls back to UNKNOWN for values the SDK
+    # does not recognise — so match on the real API values explicitly.
+    api_frequencies = {f.value: f for f in EventFrequency if f is not EventFrequency.UNKNOWN}
+    parsed_frequencies: list[EventFrequency] = []
+    for raw in frequencies or []:
+        parsed = api_frequencies.get(raw.strip().upper())
+        if parsed is None:
+            valid = ", ".join(api_frequencies)
+            raise ValueError(f"Invalid frequency: {raw!r}. Expected one of: {valid}")
+        parsed_frequencies.append(parsed)
+
+    if symbols or parsed_frequencies or resolution_time_start or resolution_time_end:
+        filter_kwargs: dict[str, Any] = {
+            "event_symbols": symbols,
+            "frequencies": parsed_frequencies or [EventFrequency.ALL],
+        }
+        for field_name, raw in [
+            ("resolution_time_start", resolution_time_start),
+            ("resolution_time_end", resolution_time_end),
+        ]:
+            if raw is not None:
+                filter_kwargs[field_name] = _parse_timestamp(field_name, raw)
+        req_kwargs["filters"] = EventSummaryFilters(**filter_kwargs)
+
+    return EventSummaryRequest(**req_kwargs)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Event Categories",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_event_categories() -> str:
+    """
+    List the categories for browsing event contracts (prediction markets).
+
+    Each category carries its subcategories and the frequency filters it
+    supports. Pass a returned `category` (and optionally `subcategory`) to
+    get_event_summary to browse the events in it.
+    """
+    try:
+        async with _get_client() as client:
+            categories = await client.get_event_categories()
+            return _serialize(categories)
+    except Exception as e:
+        logger.error("get_event_categories failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Event Summary",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_event_summary(
+    sorting_mode: Literal["VOLUME", "EXPIRATION", "RECENTLY_ADDED"] = "VOLUME",
+    category: str | None = None,
+    subcategory: str | None = None,
+    event_symbols: list[str] | None = None,
+    frequencies: list[str] | None = None,
+    resolution_time_start: str | None = None,
+    resolution_time_end: str | None = None,
+    display_resolved_events: bool | None = None,
+    created_within_days: int | None = None,
+    next_token: str | None = None,
+) -> str:
+    """
+    Browse event contracts (prediction-market events), one page at a time.
+
+    Returns up to 100 events per page, each with its eventSymbol, title, volume,
+    resolution time, resolved/halted flags, category and contract symbols. Pass an
+    eventSymbol to get_event_details for its outcomes, YES/NO contracts and pricing.
+    Results can include resolved and halted events. When the response carries a
+    `nextToken`, call again with the same arguments plus that next_token to fetch
+    the next page; it is absent on the last page.
+
+    eventSymbol (e.g. "KALSHI.KXBALANCESHEET-EO26") is the discovery identifier.
+    It is NOT the "-EVENT" id that get_event_contract_bars takes.
+
+    Args:
+        sorting_mode: VOLUME (default), EXPIRATION, or RECENTLY_ADDED.
+        category: Only events in this category (from get_event_categories).
+        subcategory: Only events in this subcategory.
+        event_symbols: Only these events, by eventSymbol.
+        frequencies: Only events recurring at these frequencies. Any of ALL, ONCE,
+            FIFTEEN_MINUTES, ONE_HOUR, ONE_DAY, ONE_WEEK, ONE_MONTH, ONE_YEAR.
+        resolution_time_start: Only events resolving at or after this ISO 8601
+            timestamp (e.g. 2026-12-31T00:00:00Z).
+        resolution_time_end: Only events resolving at or before this ISO 8601
+            timestamp.
+        display_resolved_events: Include (true) or exclude (false) resolved events.
+            Omit for the API default.
+        created_within_days: Only events created within the last N days.
+        next_token: The nextToken from the previous page, to fetch the next one.
+    """
+    try:
+        req = _build_event_summary_request(
+            sorting_mode=sorting_mode,
+            category=category,
+            subcategory=subcategory,
+            event_symbols=event_symbols,
+            frequencies=frequencies,
+            resolution_time_start=resolution_time_start,
+            resolution_time_end=resolution_time_end,
+            display_resolved_events=display_resolved_events,
+            created_within_days=created_within_days,
+            next_token=next_token,
+        )
+        async with _get_client() as client:
+            page = await client.get_event_summary(event_summary_request=req)
+            return _serialize(page)
+    except Exception as e:
+        logger.error("get_event_summary failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Event Details",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_event_details(event_symbol: str, include_all_outcomes: bool = True) -> str:
+    """
+    Get full details for one event contract (prediction-market event).
+
+    Returns the event's outcomes, the YES/NO contracts for each outcome with
+    current pricing (bid, ask, last, probability, open interest, daily gain), the
+    trading timeline (open, close, expected expiration, settlement), and the CFTC
+    contract terms. Prices are in dollars between 0.00 and 1.00 and equal the
+    implied probability.
+
+    Args:
+        event_symbol: The eventSymbol from get_event_summary, e.g.
+            "KALSHI.KXBALANCESHEET-EO26". Not the "-EVENT" id that
+            get_event_contract_bars takes. An unknown eventSymbol returns an
+            error with code 7004.
+        include_all_outcomes: True (default) returns every outcome; False returns
+            a short list of up to 8. outcomeCount always reports the full total.
+    """
+    try:
+        async with _get_client() as client:
+            details = await client.get_event_details(
+                event_symbol=event_symbol.strip().upper(),
+                include_all_outcomes=include_all_outcomes,
+            )
+            return _serialize(details)
+    except Exception as e:
+        logger.error(
+            "get_event_details failed (event_symbol=%s): %s", event_symbol, e, exc_info=True
+        )
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Event Contract Bars",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_event_contract_bars(
+    event_id: str,
+    period: Literal["DAY", "WEEK", "MONTH", "ALL"],
+    symbols: list[str],
+) -> str:
+    """
+    Get price-history bars for up to 8 event contracts of one event.
+
+    Prices and OHLC values are in dollars (0.00 to 1.00) for the side the symbol
+    names — a ".N" symbol carries the NO prices — and equal the implied
+    probability (multiply by 100 for cents / percent). Bars start at the first
+    period with a price, so charts in one response can start at different
+    timestamps: align them by timestamp, not by index. A symbol is left out of
+    the response when it is unknown or has no price in the period.
+
+    This endpoint takes the charting identifiers, not the discovery ones that
+    get_event_summary / get_event_details use.
+
+    Args:
+        event_id: The "-EVENT" grouping id the contracts belong to, e.g.
+            "KALSHI.KXBALANCESHEET-EO26-EVENT". The API rejects an id that is not
+            an -EVENT id.
+        period: DAY, WEEK, MONTH, or ALL. Measured back from now, or from the
+            event's close time once it has stopped trading.
+        symbols: 1 to 8 "-EVENTCONTRACT" symbols of that event, e.g.
+            ["KALSHI.KXBALANCESHEET-EO26-6.6.Y-EVENTCONTRACT"].
+    """
+    try:
+        async with _get_client() as client:
+            charts = await client.get_event_contract_bars(
+                event_id=event_id.strip().upper(),
+                period=EventContractBarPeriod(period.upper()),
+                symbols=[symbol.strip().upper() for symbol in symbols],
+            )
+            return _serialize(charts)
+    except Exception as e:
+        logger.error(
+            "get_event_contract_bars failed (event_id=%s): %s", event_id, e, exc_info=True
+        )
         return f"Error: {e}"
 
 

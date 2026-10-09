@@ -18,10 +18,11 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_accounts` | List all brokerage accounts |
 | `get_portfolio` | View positions, equity, buying power, open orders |
 | `get_orders` | List active/open orders (bracket legs share a `bracketId`) |
-| `get_order` | Get status of a specific order |
+| `get_order` | Status and details of a specific order, including its fills (`trades`, `filledAt`, `replacedAt`, `lastModified`); last 30 days |
+| `search_orders` | Search order history — any status, last 30 days, up to 500 orders, filtered by status/side/symbols/type/time |
 | `get_history` | Transaction history (trades, deposits, dividends, etc.) |
-| `get_quotes` | Real-time quotes for stocks, crypto, options |
-| `get_price_history` | OHLCV price history for equities, crypto, options, or indices |
+| `get_quotes` | Real-time quotes for stocks, crypto, options, event contracts |
+| `get_price_history` | OHLCV price history for equities, crypto, options, indices, or event contracts |
 | `get_instrument` | Details about a specific tradeable instrument |
 | `get_all_instruments` | List all available instruments with filters |
 | `search_bonds` | Filtered, paged search for fixed income instruments |
@@ -34,6 +35,10 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_tax_lots_for_symbol` | Unrealized tax-lot detail for a single symbol |
 | `get_tax_lots_csv` | Export unrealized tax lots as a Base64-encoded CSV file |
 | `get_strategy_quote` | Consolidated quote for a multi-leg option strategy |
+| `get_event_categories` | Event-contract (prediction market) categories, subcategories and frequency filters |
+| `get_event_summary` | Browse event contracts by category / symbol / frequency / resolution time, 100 per page |
+| `get_event_details` | One event's outcomes, YES/NO contract prices, timeline and CFTC terms |
+| `get_event_contract_bars` | Price-history bars for up to 8 contracts of one event |
 | `preflight_order` | Estimate costs/impact before placing a single-leg order |
 | `preflight_multileg_order` | Estimate costs for multi-leg options strategies |
 | `preflight_short_order` | Estimate costs before placing a short-sale order |
@@ -77,6 +82,40 @@ The API accepts brackets for `EQUITY` and `OPTION` only; they need a whole-share
 `quantity` (not `amount`), must use the `CORE` market session, and the entry
 `order_type` must be `LIMIT` or `MARKET` (`LIMIT` only for `OCO`). `preflight_order`
 validates the entry order only — it has no view of the exit legs.
+
+### Order history
+
+`get_orders` lists only the open/active orders in the portfolio snapshot. For everything
+else use the order-history tools:
+
+| Tool | Returns |
+|------|-------------|
+| `search_orders` | Orders in any status (filled, cancelled, rejected, …) matching optional `status`, `side`, `symbols` (`"SYMBOL"` or `"SYMBOL:TYPE"`), `security_type`, `open_close_indicator`, `created_after` / `created_before` filters |
+| `get_order` | One order by ID in the same shape |
+
+Both are limited by the API to orders created within the **last 30 days**, and
+`search_orders` returns at most **500** orders. Each order includes `trades` (the
+individual fills), `filledAt`, `replacedAt`, `lastModified` and `equityMarketSession`.
+Note that `equityMarketSession` uses `REGULAR` / `REST_OF_DAY` / `TWENTY_FOUR_HOURS`,
+which is not the `CORE` / `EXTENDED` / `TWENTY_FOUR_HOURS` vocabulary that
+`place_order`'s `equity_market_session` argument takes.
+
+### Event contracts
+
+Event contracts (prediction markets) are read-only here. Browse with
+`get_event_categories` → `get_event_summary` (page with `next_token`) →
+`get_event_details`, and chart with `get_event_contract_bars`. Prices are dollars from
+0.00 to 1.00 and equal the implied probability.
+
+The two halves take different identifiers, and the API rejects the wrong one:
+
+| Tools | Event identifier | Contract symbol |
+|------|-------------|-------------|
+| `get_event_summary`, `get_event_details` | `eventSymbol`, e.g. `KALSHI.KXBALANCESHEET-EO26` | e.g. `KALSHI.KXBALANCESHEET-EO26-6.6.Y` |
+| `get_event_contract_bars` | `-EVENT` id, e.g. `KALSHI.KXBALANCESHEET-EO26-EVENT` | `-EVENTCONTRACT` symbol, e.g. `KALSHI.KXBALANCESHEET-EO26-6.6.Y-EVENTCONTRACT` |
+
+`EVENTCONTRACT` is also accepted as an instrument type by `get_quotes`,
+`get_price_history`, `get_instrument`, `get_all_instruments` and `search_orders`.
 
 ## Prerequisites
 
