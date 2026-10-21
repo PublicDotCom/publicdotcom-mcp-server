@@ -37,8 +37,10 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_strategy_quote` | Consolidated quote for a multi-leg option strategy |
 | `get_event_categories` | Event-contract (prediction market) categories, subcategories and frequency filters |
 | `get_event_summary` | Browse event contracts by category / symbol / frequency / resolution time, 100 per page |
-| `get_event_details` | One event's outcomes, YES/NO contract prices, timeline and CFTC terms |
+| `get_event_details` | One event's outcomes, YES/NO contract prices, timeline and CFTC terms, plus per-outcome `tradable` / `secondsLeft` / `winner` |
 | `get_event_contract_bars` | Price-history bars for up to 8 contracts of one event |
+| `get_current_event` | The window of a recurring market (e.g. 15-minute `KXBTC15M`) trading right now; optional bounded wait |
+| `wait_for_settlement` | Wait (bounded) for an event outcome to settle and report the winning contract |
 | `preflight_order` | Estimate costs/impact before placing a single-leg order |
 | `preflight_multileg_order` | Estimate costs for multi-leg options strategies |
 | `preflight_short_order` | Estimate costs before placing a short-sale order |
@@ -46,6 +48,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `preflight_call_debit_spread` | Estimate costs for a Bull Call Spread |
 | `preflight_put_credit_spread` | Estimate costs for a Bull Put Spread |
 | `preflight_put_debit_spread` | Estimate costs for a Bear Put Spread |
+| `preflight_buy_event_contract` | Estimate costs before buying an event contract (YES or NO side) |
 
 ### Write (Destructive)
 
@@ -58,6 +61,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `place_put_credit_spread` | Place a Bull Put Spread |
 | `place_put_debit_spread` | Place a Bear Put Spread |
 | `place_short_order` | Place an equity short-sale order |
+| `buy_event_contract` | Buy an event contract (YES or NO side) with a DAY limit order, at the ask by default |
 | `flatten_and_go_short` | Sell an existing long position then go short (experimental) |
 | `cancel_order` | Cancel an existing order |
 | `cancel_and_replace_order` | Atomically cancel and replace an order |
@@ -102,16 +106,34 @@ which is not the `CORE` / `EXTENDED` / `TWENTY_FOUR_HOURS` vocabulary that
 
 ### Event contracts
 
-Event contracts (prediction markets) are read-only here. Browse with
-`get_event_categories` → `get_event_summary` (page with `next_token`) →
-`get_event_details`, and chart with `get_event_contract_bars`. Prices are dollars from
-0.00 to 1.00 and equal the implied probability.
+Browse event contracts (prediction markets) with `get_event_categories` →
+`get_event_summary` (page with `next_token`) → `get_event_details`, and chart with
+`get_event_contract_bars`. Prices are dollars from 0.00 to 1.00 and equal the implied
+probability. `EventSummary.symbols` lists related instruments (e.g. `BTC-CRYPTO`), not
+the event's contracts — those come from `get_event_details`. Outcome ids carry no
+exchange prefix (e.g. `KXBALANCESHEET-EO26-6.6`).
+
+#### Trading recurring markets
+
+For a recurring market such as the 15-minute "Up or Down" windows:
+
+1. `get_current_event(series="KXBTC15M")` — the window open right now (`series` is the
+   series ticker, shown on every `get_event_summary` / `get_event_details` result).
+   Pass `wait_seconds` (≤ 120) to wait between windows.
+2. `get_event_details(event_symbol)` — the YES/NO contracts, their asks, and whether the
+   outcome is `tradable` and how many `secondsLeft`.
+3. `preflight_buy_event_contract` → `buy_event_contract(contract_symbol, quantity,
+   limit_price)` — a DAY limit buy. Omit `limit_price` and pass `event_symbol` to buy at
+   the current ask, rounded up to a whole cent. Quantities take at most 2 decimals.
+4. `wait_for_settlement(event_symbol, contract_symbol=...)` — waits up to 120 s per call
+   and reports `winner` and `won`; on timeout it returns `"status": "pending"`, so call
+   again.
 
 The two halves take different identifiers, and the API rejects the wrong one:
 
 | Tools | Event identifier | Contract symbol |
 |------|-------------|-------------|
-| `get_event_summary`, `get_event_details` | `eventSymbol`, e.g. `KALSHI.KXBALANCESHEET-EO26` | e.g. `KALSHI.KXBALANCESHEET-EO26-6.6.Y` |
+| `get_event_summary`, `get_event_details`, `get_current_event`, `wait_for_settlement`, `*buy_event_contract` | `eventSymbol`, e.g. `KALSHI.KXBALANCESHEET-EO26` | e.g. `KALSHI.KXBALANCESHEET-EO26-6.6.Y` |
 | `get_event_contract_bars` | `-EVENT` id, e.g. `KALSHI.KXBALANCESHEET-EO26-EVENT` | `-EVENTCONTRACT` symbol, e.g. `KALSHI.KXBALANCESHEET-EO26-6.6.Y-EVENTCONTRACT` |
 
 `EVENTCONTRACT` is also accepted as an instrument type by `get_quotes`,

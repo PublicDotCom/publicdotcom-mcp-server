@@ -16,7 +16,7 @@ import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -42,10 +42,15 @@ from public_api_sdk.models import (
     CancelAndReplaceRequest,
     CouponFrequency,
     EquityMarketSession,
+    EventContract,
     EventContractBarPeriod,
+    EventDetails,
     EventFrequency,
+    EventOutcome,
     EventSortingMode,
+    EventSummary,
     EventSummaryFilters,
+    EventSummaryPage,
     EventSummaryRequest,
     GatewayTaxLotMatchingInstruction,
     HistoryRequest,
@@ -78,6 +83,7 @@ from public_api_sdk.models import (
     Trading,
     TradingSessionToggle,
     TreasurySubtype,
+    WaitTimeoutError,
 )
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -105,8 +111,8 @@ mcp = FastMCP(
     instructions=(
         "MCP server for the Public.com Trading API. Provides tools to view "
         "portfolio, get quotes, place/cancel orders, search order history, look up "
-        "instruments, work with options, and browse event contracts (prediction "
-        "markets) — all through a Public.com "
+        "instruments, work with options, and browse and buy event contracts "
+        "(prediction markets) — all through a Public.com "
         "brokerage account. Requires a PUBLIC_COM_SECRET environment variable."
     ),
 )
@@ -1443,8 +1449,9 @@ async def get_strategy_quote(
 
 # Event contracts use two identifier families, and the endpoints are strict about
 # which one they take:
-#   - discovery (get_event_summary / get_event_details): the event's eventSymbol,
-#     e.g. "KALSHI.KXBALANCESHEET-EO26", and contract symbols such as
+#   - discovery and trading (get_event_summary / get_event_details /
+#     get_current_event / wait_for_settlement / *buy_event_contract): the event's
+#     eventSymbol, e.g. "KALSHI.KXBALANCESHEET-EO26", and contract symbols such as
 #     "KALSHI.KXBALANCESHEET-EO26-6.6.Y";
 #   - charting (get_event_contract_bars): the "-EVENT" grouping id, e.g.
 #     "KALSHI.KXBALANCESHEET-EO26-EVENT", and "-EVENTCONTRACT" symbols, e.g.
@@ -1520,6 +1527,102 @@ def _build_event_summary_request(
     return EventSummaryRequest(**req_kwargs)
 
 
+# Waits are bounded so a tool call returns well within an MCP client's request
+# timeout; the caller polls again for longer waits.
+_MAX_EVENT_WAIT_SECONDS = 120
+_EVENT_WAIT_POLL_INTERVAL = 10.0
+
+
+def _parse_event_frequency(raw: str) -> EventFrequency:
+    """Parse a recurrence frequency; ALL, ONCE and UNKNOWN name no recurring series."""
+    # EventFrequency(...) never raises — it falls back to UNKNOWN — so match explicitly.
+    allowed = {
+        f.value: f
+        for f in EventFrequency
+        if f not in (EventFrequency.ALL, EventFrequency.ONCE, EventFrequency.UNKNOWN)
+    }
+    parsed = allowed.get(raw.strip().upper())
+    if parsed is None:
+        valid = ", ".join(allowed)
+        raise ValueError(f"Invalid frequency: {raw!r}. Expected one of: {valid}")
+    return parsed
+
+
+def _bounded_wait(name: str, seconds: float) -> float:
+    if not 0 <= seconds <= _MAX_EVENT_WAIT_SECONDS:
+        raise ValueError(f"{name} must be between 0 and {_MAX_EVENT_WAIT_SECONDS} seconds")
+    return seconds
+
+
+def _event_summary_data(event: EventSummary) -> dict[str, Any]:
+    """An event summary as the API returns it, plus the SDK's derived series ticker."""
+    data = event.model_dump(by_alias=True, exclude_none=True)
+    if event.series is not None:
+        data["series"] = event.series
+    return data
+
+
+def _event_outcome_data(outcome: EventOutcome) -> dict[str, Any]:
+    """An outcome as the API returns it, plus the SDK's derived trading shortcuts."""
+    data = outcome.model_dump(by_alias=True, exclude_none=True)
+    data["tradable"] = outcome.is_tradable
+    if outcome.seconds_left is not None:
+        data["secondsLeft"] = round(outcome.seconds_left)
+    if outcome.winner is not None:
+        data["winner"] = outcome.winner.symbol
+    return data
+
+
+def _event_details_data(details: EventDetails) -> dict[str, Any]:
+    data = details.model_dump(by_alias=True, exclude_none=True)
+    if details.series is not None:
+        data["series"] = details.series
+    data["outcomes"] = [_event_outcome_data(o) for o in details.outcomes]
+    return data
+
+
+def _event_summary_page_data(page: EventSummaryPage) -> dict[str, Any]:
+    data = page.model_dump(by_alias=True, exclude_none=True)
+    data["content"] = [_event_summary_data(e) for e in page.content]
+    return data
+
+
+def _find_event_contract(details: EventDetails, contract_symbol: str) -> EventContract:
+    for outcome in details.outcomes:
+        for contract in outcome.contracts:
+            if contract.symbol.upper() == contract_symbol:
+                return contract
+    raise ValueError(f"{details.event_symbol} has no contract {contract_symbol!r}")
+
+
+async def _resolve_event_contract_buy(
+    client: AsyncPublicApiClient,
+    contract_symbol: str,
+    limit_price: str | None,
+    event_symbol: str | None,
+) -> Decimal:
+    """The limit price for buying ``contract_symbol``.
+
+    An explicit ``limit_price`` is used as given (the SDK checks it is whole cents
+    between 0.01 and 0.99). Otherwise the contract's current ask is looked up in
+    ``event_symbol``'s details and rounded up to a whole cent, as the SDK does when
+    it is handed the contract itself.
+    """
+    if limit_price is not None:
+        return Decimal(limit_price)
+    if not event_symbol:
+        raise ValueError(
+            "Pass limit_price, or event_symbol so the contract's ask can be looked up"
+        )
+    details = await client.get_event_details(
+        event_symbol=event_symbol.strip().upper(), include_all_outcomes=True
+    )
+    contract = _find_event_contract(details, contract_symbol)
+    if contract.ask is None:
+        raise ValueError(f"{contract.symbol} has no ask; pass limit_price")
+    return contract.ask.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+
 @mcp.tool(
     annotations={
         "title": "Get Event Categories",
@@ -1569,8 +1672,11 @@ async def get_event_summary(
     Browse event contracts (prediction-market events), one page at a time.
 
     Returns up to 100 events per page, each with its eventSymbol, title, volume,
-    resolution time, resolved/halted flags, category and contract symbols. Pass an
-    eventSymbol to get_event_details for its outcomes, YES/NO contracts and pricing.
+    resolution time, resolved/halted flags, category, related instrument symbols
+    (e.g. BTC-CRYPTO; often empty — these are NOT the event's contracts), and
+    `series`, the series ticker of a recurring market (e.g. "KXBTC15M"; derived
+    from the eventSymbol, pass it to get_current_event). Pass an eventSymbol to
+    get_event_details for its outcomes, YES/NO contracts and pricing.
     Results can include resolved and halted events. When the response carries a
     `nextToken`, call again with the same arguments plus that next_token to fetch
     the next page; it is absent on the last page.
@@ -1609,7 +1715,7 @@ async def get_event_summary(
         )
         async with _get_client() as client:
             page = await client.get_event_summary(event_summary_request=req)
-            return _serialize(page)
+            return _serialize(_event_summary_page_data(page))
     except Exception as e:
         logger.error("get_event_summary failed: %s", e, exc_info=True)
         return f"Error: {e}"
@@ -1631,7 +1737,14 @@ async def get_event_details(event_symbol: str, include_all_outcomes: bool = True
     current pricing (bid, ask, last, probability, open interest, daily gain), the
     trading timeline (open, close, expected expiration, settlement), and the CFTC
     contract terms. Prices are in dollars between 0.00 and 1.00 and equal the
-    implied probability.
+    implied probability. Outcome ids carry no exchange prefix (e.g.
+    "KXBALANCESHEET-EO26-6.6"); contract symbols do.
+
+    Each outcome also carries shortcuts derived by the SDK: `tradable` (open, in
+    BUY_AND_SELL mode and before its close time — state alone can still read
+    STATE_OPEN after close), `secondsLeft` until close, and once settled YES or NO,
+    `winner` (the contract symbol that paid out). The event carries `series`, its
+    series ticker.
 
     Args:
         event_symbol: The eventSymbol from get_event_summary, e.g.
@@ -1647,7 +1760,7 @@ async def get_event_details(event_symbol: str, include_all_outcomes: bool = True
                 event_symbol=event_symbol.strip().upper(),
                 include_all_outcomes=include_all_outcomes,
             )
-            return _serialize(details)
+            return _serialize(_event_details_data(details))
     except Exception as e:
         logger.error(
             "get_event_details failed (event_symbol=%s): %s", event_symbol, e, exc_info=True
@@ -1701,6 +1814,151 @@ async def get_event_contract_bars(
     except Exception as e:
         logger.error(
             "get_event_contract_bars failed (event_id=%s): %s", event_id, e, exc_info=True
+        )
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Current Event",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def get_current_event(
+    series: str,
+    frequency: Literal[
+        "FIFTEEN_MINUTES", "ONE_HOUR", "ONE_DAY", "ONE_WEEK", "ONE_MONTH", "ONE_YEAR"
+    ] = "FIFTEEN_MINUTES",
+    category: str | None = None,
+    subcategory: str | None = None,
+    wait_seconds: int = 0,
+) -> str:
+    """
+    Find the event of a recurring market that is trading right now.
+
+    For a 15-minute "Up or Down" series such as "KXBTC15M" this is the current
+    window: the open event of the series that closes soonest. Windows whose
+    resolution time has passed are skipped, even though the API keeps listing them
+    as unresolved for a few minutes after they close. Pass the returned eventSymbol
+    to get_event_details for the YES/NO contracts and their asks, then
+    preflight_buy_event_contract / buy_event_contract.
+
+    Args:
+        series: Series ticker, e.g. "KXBTC15M" — the `series` field of
+            get_event_summary / get_event_details results.
+        frequency: How often the series recurs. Default FIFTEEN_MINUTES; e.g.
+            ONE_HOUR for hourly series.
+        category: Only search this category (from get_event_categories), e.g. "Crypto".
+            Narrowing the search makes it faster.
+        subcategory: Only search this subcategory, e.g. "BTC".
+        wait_seconds: If no event is open yet, keep checking for up to this many
+            seconds (0 to 120; default 0 = check once). Between windows, the next
+            one is typically listed a minute or two after the previous one closes.
+    """
+    try:
+        freq = _parse_event_frequency(frequency)
+        timeout = _bounded_wait("wait_seconds", wait_seconds)
+        async with _get_client() as client:
+            if timeout:
+                try:
+                    event = await client.wait_for_current_event(
+                        series,
+                        freq,
+                        category=category,
+                        subcategory=subcategory,
+                        timeout=timeout,
+                        poll_interval=_EVENT_WAIT_POLL_INTERVAL,
+                    )
+                except WaitTimeoutError:
+                    event = None
+            else:
+                event = await client.get_current_event(
+                    series, freq, category=category, subcategory=subcategory
+                )
+        if event is None:
+            waited = f" within {timeout}s" if timeout else ""
+            return json.dumps(
+                {
+                    "series": series.strip().upper(),
+                    "status": "no_open_event",
+                    "message": (
+                        f"No open {freq.value} event of {series.strip().upper()}{waited}. "
+                        "The next window may not be listed yet — try again shortly "
+                        "(or pass wait_seconds), and check the series ticker and frequency."
+                    ),
+                },
+                indent=2,
+            )
+        return _serialize(_event_summary_data(event))
+    except Exception as e:
+        logger.error("get_current_event failed (series=%s): %s", series, e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Wait For Settlement",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def wait_for_settlement(
+    event_symbol: str,
+    outcome_id: str | None = None,
+    contract_symbol: str | None = None,
+    timeout_seconds: int = 60,
+) -> str:
+    """
+    Wait for an event's outcome to settle and report which side won.
+
+    A 15-minute window settles a few minutes after it closes, which can be longer
+    than one call waits: on a timeout the response has status "pending" and the
+    outcome's current state — call again to keep waiting.
+
+    Once settled, the response carries the outcome (with `settledOutcome`, e.g.
+    SETTLED_OUTCOME_YES), `winner` (the contract symbol that paid out, absent for any
+    settlement other than YES/NO), and, if contract_symbol was given, `won`.
+
+    Args:
+        event_symbol: The eventSymbol, e.g. "KALSHI.KXBTC15M-26OCT201200".
+        outcome_id: The outcome to watch (outcomeId from get_event_details). May be
+            omitted for an event with a single outcome, such as a 15-minute
+            "Up or Down" window.
+        contract_symbol: Optional contract you hold or bought, e.g.
+            "KALSHI.KXBTC15M-26OCT201200-00.Y", to report whether it won.
+        timeout_seconds: How long to wait in this call (0 to 120; default 60).
+            0 checks once.
+    """
+    symbol = event_symbol.strip().upper()
+    try:
+        timeout = _bounded_wait("timeout_seconds", timeout_seconds)
+        async with _get_client() as client:
+            outcome = await client.wait_for_settlement(
+                symbol,
+                outcome_id,
+                timeout=timeout,
+                poll_interval=_EVENT_WAIT_POLL_INTERVAL,
+            )
+        data = _event_outcome_data(outcome)
+        data["status"] = "settled"
+        if contract_symbol:
+            data["won"] = outcome.won(contract_symbol.strip().upper())
+        return _serialize(data)
+    except WaitTimeoutError as e:
+        return json.dumps(
+            {
+                "eventSymbol": symbol,
+                "status": "pending",
+                "message": f"Not settled yet: {e}. Call wait_for_settlement again to keep waiting.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error(
+            "wait_for_settlement failed (event_symbol=%s): %s", event_symbol, e, exc_info=True
         )
         return f"Error: {e}"
 
@@ -2180,6 +2438,62 @@ async def preflight_put_debit_spread(
             return _serialize(result)
     except Exception as e:
         logger.error("preflight_put_debit_spread failed: %s", e, exc_info=True)
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Preflight Buy Event Contract",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    },
+)
+async def preflight_buy_event_contract(
+    contract_symbol: str,
+    quantity: str = "1",
+    limit_price: str | None = None,
+    event_symbol: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    """
+    Price a buy of an event contract (a YES or NO side) without placing it.
+
+    Prices the same DAY limit buy that buy_event_contract would place. The response
+    holds the limit price used and the preflight estimate, whose estimatedCost
+    includes the commission and exchange fee. Does NOT place an order.
+
+    Args:
+        contract_symbol: The contract to buy, from get_event_details, e.g.
+            "KALSHI.KXBTC15M-26OCT201200-00.Y" (".Y" = YES, ".N" = NO). Not the
+            "-EVENTCONTRACT" symbol that get_event_contract_bars takes.
+        quantity: Number of contracts (default "1"); at most 2 decimal places.
+        limit_price: Most to pay per contract, in dollars with whole cents between
+            0.01 and 0.99 (e.g. "0.55"). If omitted, the contract's current ask is
+            looked up via event_symbol and rounded up to a whole cent.
+        event_symbol: The contract's eventSymbol, e.g. "KALSHI.KXBTC15M-26OCT201200".
+            Required when limit_price is omitted.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    symbol = contract_symbol.strip().upper()
+    try:
+        async with _get_client(account_id) as client:
+            price = await _resolve_event_contract_buy(client, symbol, limit_price, event_symbol)
+            result = await client.preflight_buy_event_contract(
+                symbol, Decimal(quantity), limit_price=price, account_id=account_id
+            )
+        return _serialize(
+            {
+                "contractSymbol": symbol,
+                "quantity": quantity,
+                "limitPrice": price,
+                "preflight": result,
+            }
+        )
+    except Exception as e:
+        logger.error(
+            "preflight_buy_event_contract failed (contract=%s): %s", symbol, e, exc_info=True
+        )
         return f"Error: {e}"
 
 
@@ -3103,6 +3417,90 @@ async def cancel_and_replace_order(
                 "message": (
                     f"Cancel-and-replace failed: {e}. "
                     f"Use get_order({order_id!r}) to check the original order status."
+                ),
+            },
+            indent=2,
+        )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Buy Event Contract",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def buy_event_contract(
+    contract_symbol: str,
+    quantity: str = "1",
+    limit_price: str | None = None,
+    event_symbol: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    """
+    Buy an event contract (a YES or NO side of a prediction market) with a DAY
+    limit order.
+
+    ⚠️ This executes a real trade. Consider running preflight_buy_event_contract
+    first. For a recurring market such as a 15-minute window, find the window with
+    get_current_event, its contracts with get_event_details, and the result with
+    wait_for_settlement.
+
+    Args:
+        contract_symbol: The contract to buy, from get_event_details, e.g.
+            "KALSHI.KXBTC15M-26OCT201200-00.Y" (".Y" = YES, ".N" = NO). Not the
+            "-EVENTCONTRACT" symbol that get_event_contract_bars takes.
+        quantity: Number of contracts (default "1"); at most 2 decimal places.
+        limit_price: Most to pay per contract, in dollars with whole cents between
+            0.01 and 0.99 (e.g. "0.55"). If omitted, the contract's current ask is
+            looked up via event_symbol and rounded up to a whole cent.
+        event_symbol: The contract's eventSymbol, e.g. "KALSHI.KXBTC15M-26OCT201200".
+            Required when limit_price is omitted.
+        account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
+    """
+    order_id = str(uuid4())
+    symbol = contract_symbol.strip().upper()
+
+    try:
+        async with _get_client(account_id) as client:
+            price = await _resolve_event_contract_buy(client, symbol, limit_price, event_symbol)
+            logger.info(
+                "Buying event contract: order_id=%s contract=%s qty=%s limit=%s",
+                order_id, symbol, quantity, price,
+            )
+            new_order = await client.buy_event_contract(
+                symbol,
+                Decimal(quantity),
+                limit_price=price,
+                order_id=order_id,
+                account_id=account_id,
+            )
+        logger.info("Order accepted: order_id=%s returned_order_id=%s", order_id, new_order.order_id)
+        return json.dumps(
+            {
+                "order_id": new_order.order_id,
+                "status": "submitted",
+                "contract_symbol": symbol,
+                "quantity": quantity,
+                "limit_price": str(price),
+                "message": (
+                    "Order submitted. Placement is asynchronous — use "
+                    "get_order to confirm status."
+                ),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.error("buy_event_contract failed (order_id=%s): %s", order_id, e, exc_info=True)
+        return json.dumps(
+            {
+                "order_id": order_id,
+                "status": "error",
+                "message": (
+                    f"Order submission failed: {e}. "
+                    f"Use get_order({order_id!r}) to check if the order was accepted."
                 ),
             },
             indent=2,
