@@ -721,3 +721,36 @@ class TestGetStrategyQuote:
             base_symbol="SPY", option_legs=self.SAMPLE_OPTION_LEGS
         )
         assert "Error" in result
+
+
+class TestReadOnlyToolDescriptions:
+    """Read-only tool descriptions must not name write tools.
+
+    The hosted connector serves the read-only tools on their own endpoint
+    without the write tools, so a description that points at e.g. place_order
+    would have the client suggest a trade it cannot make.
+    """
+
+    @staticmethod
+    def _tools():
+        from publicdotcom_mcp_server.server import mcp
+
+        return list(mcp._tool_manager._tools.values())
+
+    def test_read_and_write_tools_both_exist(self):
+        tools = self._tools()
+        assert any(t.annotations.readOnlyHint for t in tools)
+        assert any(not t.annotations.readOnlyHint for t in tools)
+
+    def test_no_read_only_description_mentions_a_write_tool(self):
+        import re
+
+        tools = self._tools()
+        write_names = [t.name for t in tools if not t.annotations.readOnlyHint]
+        pattern = re.compile(r"\b(" + "|".join(map(re.escape, write_names)) + r")\b")
+        offenders = {
+            t.name: sorted(set(pattern.findall(t.description or "")))
+            for t in tools
+            if t.annotations.readOnlyHint and pattern.search(t.description or "")
+        }
+        assert offenders == {}

@@ -577,9 +577,7 @@ async def get_order(order_id: str, account_id: str | None = None) -> str:
     timestamp and, when reported, marketIdentificationCode — the ISO 10383 MIC
     of the execution venue, e.g. XNAS), `filledAt`, `replacedAt`, `lastModified`
     and `equityMarketSession`. `equityMarketSession` reports the session as REGULAR,
-    REST_OF_DAY or TWENTY_FOUR_HOURS — a different vocabulary from place_order's
-    `equity_market_session` argument (CORE / EXTENDED / TWENTY_FOUR_HOURS); never
-    feed one into the other.
+    REST_OF_DAY or TWENTY_FOUR_HOURS.
 
     Only orders created within the last 30 days can be looked up; older orders
     return a not-found error. Order placement is asynchronous, so this may also
@@ -638,9 +636,7 @@ async def search_orders(
     reported, marketIdentificationCode — the MIC of the execution venue), `filledAt`,
     `replacedAt`, `lastModified` and `equityMarketSession`. `equityMarketSession`
     reports the session an equity order was placed for as REGULAR, REST_OF_DAY or
-    TWENTY_FOUR_HOURS — a different vocabulary from place_order's
-    `equity_market_session` argument (CORE / EXTENDED / TWENTY_FOUR_HOURS); never
-    feed one into the other.
+    TWENTY_FOUR_HOURS.
 
     Args:
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
@@ -1849,7 +1845,7 @@ async def get_current_event(
     resolution time has passed are skipped, even though the API keeps listing them
     as unresolved for a few minutes after they close. Pass the returned eventSymbol
     to get_event_details for the YES/NO contracts and their asks, then
-    preflight_buy_event_contract / buy_event_contract.
+    preflight_buy_event_contract to price a buy.
 
     Args:
         series: Series ticker, e.g. "KXBTC15M" — the `series` field of
@@ -2468,9 +2464,9 @@ async def preflight_buy_event_contract(
     """
     Price a buy of an event contract (a YES or NO side) without placing it.
 
-    Prices the same DAY limit buy that buy_event_contract would place. The response
-    holds the limit price used and the preflight estimate, whose estimatedCost
-    includes the commission and exchange fee. Does NOT place an order.
+    Prices a DAY limit buy of the contract. The response holds the limit price
+    used and the preflight estimate, whose estimatedCost includes the commission
+    and exchange fee. Does NOT place an order.
 
     Args:
         contract_symbol: The contract to buy, from get_event_details, e.g.
@@ -2558,7 +2554,9 @@ async def place_order(
         stop_price: Required for STOP and STOP_LIMIT orders.
         open_close_indicator: For options only — OPEN or CLOSE.
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
-        equity_market_session: CORE or EXTENDED. For equity orders only.
+        equity_market_session: CORE or EXTENDED. For equity orders only. Not the
+            REGULAR / REST_OF_DAY / TWENTY_FOUR_HOURS values that get_order and
+            search_orders report in `equityMarketSession`; never feed those back here.
         tax_lot_matching_instructions: Optional list of specific tax lots to
             sell, each a dict {"tax_lot_id": str, "quantity": str}. Constraints
             enforced by the API: at most 8 per request; only for a SELL equity
