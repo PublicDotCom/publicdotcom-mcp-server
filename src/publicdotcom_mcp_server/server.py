@@ -280,7 +280,7 @@ def _validate_order_params(
     """Validate order parameters and raise ValueError with a clear message on violation."""
     if quantity is not None and amount is not None:
         raise ValueError("quantity and amount are mutually exclusive — provide one, not both")
-    if order_type.upper() in ("LIMIT", "STOP_LIMIT") and limit_price is None:
+    if order_type.upper() in ("LIMIT", "STOP_LIMIT", "LIMIT_ON_CLOSE") and limit_price is None:
         raise ValueError(f"limit_price is required for {order_type} orders")
     if order_type.upper() in ("STOP", "STOP_LIMIT") and stop_price is None:
         raise ValueError(f"stop_price is required for {order_type} orders")
@@ -513,6 +513,10 @@ async def get_portfolio(account_id: str | None = None) -> str:
     cash/withdrawal figures (including cash, totalAccountValue, and
     availableToWithdraw). Only non-IRA accounts are supported.
 
+    `buyingPower` includes `dayTradeBuyingPower`, the buying power available for
+    day trading. It equals `buyingPower` when the account is not enabled for
+    day-trade buying power, and is omitted when the API does not report it.
+
     Args:
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
@@ -569,12 +573,11 @@ async def get_order(order_id: str, account_id: str | None = None) -> str:
     """
     Get the status and details of a specific order, including its fills.
 
-    Returns the order with `trades` (each fill's tradeId, quantity, price, side
-    and timestamp), `filledAt`, `replacedAt`, `lastModified` and
-    `equityMarketSession`. `equityMarketSession` reports the session as REGULAR,
-    REST_OF_DAY or TWENTY_FOUR_HOURS — a different vocabulary from place_order's
-    `equity_market_session` argument (CORE / EXTENDED / TWENTY_FOUR_HOURS); never
-    feed one into the other.
+    Returns the order with `trades` (each fill's tradeId, quantity, price, side,
+    timestamp and, when reported, marketIdentificationCode — the ISO 10383 MIC
+    of the execution venue, e.g. XNAS), `filledAt`, `replacedAt`, `lastModified`
+    and `equityMarketSession`. `equityMarketSession` reports the session as REGULAR,
+    REST_OF_DAY or TWENTY_FOUR_HOURS.
 
     Only orders created within the last 30 days can be looked up; older orders
     return a not-found error. Order placement is asynchronous, so this may also
@@ -629,12 +632,11 @@ async def search_orders(
     created_before or the other filters if a search could exceed that.
 
     Each result has the same shape as get_order: the order plus `trades` (the
-    individual fills: tradeId, quantity, price, side, timestamp), `filledAt`,
+    individual fills: tradeId, quantity, price, side, timestamp and, when
+    reported, marketIdentificationCode — the MIC of the execution venue), `filledAt`,
     `replacedAt`, `lastModified` and `equityMarketSession`. `equityMarketSession`
     reports the session an equity order was placed for as REGULAR, REST_OF_DAY or
-    TWENTY_FOUR_HOURS — a different vocabulary from place_order's
-    `equity_market_session` argument (CORE / EXTENDED / TWENTY_FOUR_HOURS); never
-    feed one into the other.
+    TWENTY_FOUR_HOURS.
 
     Args:
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
@@ -1733,12 +1735,12 @@ async def get_event_details(event_symbol: str, include_all_outcomes: bool = True
     """
     Get full details for one event contract (prediction-market event).
 
-    Returns the event's outcomes, the YES/NO contracts for each outcome with
-    current pricing (bid, ask, last, probability, open interest, daily gain), the
-    trading timeline (open, close, expected expiration, settlement), and the CFTC
-    contract terms. Prices are in dollars between 0.00 and 1.00 and equal the
-    implied probability. Outcome ids carry no exchange prefix (e.g.
-    "KXBALANCESHEET-EO26-6.6"); contract symbols do.
+    Returns the event's outcomes (each with its `floorStrike` when it has one),
+    the YES/NO contracts for each outcome with current pricing (bid, ask, last,
+    probability, open interest, daily gain), the trading timeline (open, close,
+    expected expiration, settlement), and the CFTC contract terms. Prices are in
+    dollars between 0.00 and 1.00 and equal the implied probability. Outcome ids
+    carry no exchange prefix (e.g. "KXBALANCESHEET-EO26-6.6"); contract symbols do.
 
     Each outcome also carries shortcuts derived by the SDK: `tradable` (open, in
     BUY_AND_SELL mode and before its close time — state alone can still read
@@ -1843,7 +1845,7 @@ async def get_current_event(
     resolution time has passed are skipped, even though the API keeps listing them
     as unresolved for a few minutes after they close. Pass the returned eventSymbol
     to get_event_details for the YES/NO contracts and their asks, then
-    preflight_buy_event_contract / buy_event_contract.
+    preflight_buy_event_contract to price a buy.
 
     Args:
         series: Series ticker, e.g. "KXBTC15M" — the `series` field of
@@ -2002,11 +2004,12 @@ async def preflight_order(
         symbol: Ticker symbol (e.g. "AAPL").
         instrument_type: EQUITY, OPTION, or CRYPTO.
         order_side: BUY or SELL.
-        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT.
+        order_type: MARKET, LIMIT, STOP, STOP_LIMIT, MARKET_ON_CLOSE or
+            LIMIT_ON_CLOSE. The on-close types execute at the closing auction.
         time_in_force: DAY or GTD. Default is DAY.
         quantity: Number of shares/contracts (mutually exclusive with amount).
         amount: Dollar amount (mutually exclusive with quantity).
-        limit_price: Required for LIMIT and STOP_LIMIT orders.
+        limit_price: Required for LIMIT, STOP_LIMIT and LIMIT_ON_CLOSE orders.
         stop_price: Required for STOP and STOP_LIMIT orders.
         open_close_indicator: For options only — OPEN or CLOSE.
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
@@ -2186,9 +2189,11 @@ async def preflight_short_order(
     Args:
         symbol: Ticker symbol to short (e.g. "AAPL").
         quantity: Number of shares to short.
-        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT. Default is MARKET.
+        order_type: MARKET, LIMIT, STOP, STOP_LIMIT, MARKET_ON_CLOSE or
+            LIMIT_ON_CLOSE. Default is MARKET. The on-close types execute at the
+            closing auction.
         time_in_force: DAY or GTD. Default is DAY.
-        limit_price: Required for LIMIT and STOP_LIMIT orders.
+        limit_price: Required for LIMIT, STOP_LIMIT and LIMIT_ON_CLOSE orders.
         stop_price: Required for STOP and STOP_LIMIT orders.
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         equity_market_session: CORE or EXTENDED.
@@ -2459,9 +2464,9 @@ async def preflight_buy_event_contract(
     """
     Price a buy of an event contract (a YES or NO side) without placing it.
 
-    Prices the same DAY limit buy that buy_event_contract would place. The response
-    holds the limit price used and the preflight estimate, whose estimatedCost
-    includes the commission and exchange fee. Does NOT place an order.
+    Prices a DAY limit buy of the contract. The response holds the limit price
+    used and the preflight estimate, whose estimatedCost includes the commission
+    and exchange fee. Does NOT place an order.
 
     Args:
         contract_symbol: The contract to buy, from get_event_details, e.g.
@@ -2540,15 +2545,18 @@ async def place_order(
         symbol: Ticker symbol (e.g. "AAPL").
         instrument_type: EQUITY, OPTION, or CRYPTO.
         order_side: BUY or SELL.
-        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT.
+        order_type: MARKET, LIMIT, STOP, STOP_LIMIT, MARKET_ON_CLOSE or
+            LIMIT_ON_CLOSE. The on-close types execute at the closing auction.
         time_in_force: DAY or GTD. Default is DAY.
         quantity: Number of shares/contracts (mutually exclusive with amount).
         amount: Dollar amount (mutually exclusive with quantity).
-        limit_price: Required for LIMIT and STOP_LIMIT orders.
+        limit_price: Required for LIMIT, STOP_LIMIT and LIMIT_ON_CLOSE orders.
         stop_price: Required for STOP and STOP_LIMIT orders.
         open_close_indicator: For options only — OPEN or CLOSE.
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
-        equity_market_session: CORE or EXTENDED. For equity orders only.
+        equity_market_session: CORE or EXTENDED. For equity orders only. Not the
+            REGULAR / REST_OF_DAY / TWENTY_FOUR_HOURS values that get_order and
+            search_orders report in `equityMarketSession`; never feed those back here.
         tax_lot_matching_instructions: Optional list of specific tax lots to
             sell, each a dict {"tax_lot_id": str, "quantity": str}. Constraints
             enforced by the API: at most 8 per request; only for a SELL equity
@@ -3087,9 +3095,11 @@ async def place_short_order(
     Args:
         symbol: Ticker symbol to short (e.g. "AAPL").
         quantity: Number of shares to short.
-        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT. Default is MARKET.
+        order_type: MARKET, LIMIT, STOP, STOP_LIMIT, MARKET_ON_CLOSE or
+            LIMIT_ON_CLOSE. Default is MARKET. The on-close types execute at the
+            closing auction.
         time_in_force: DAY or GTD. Default is DAY.
-        limit_price: Required for LIMIT and STOP_LIMIT orders.
+        limit_price: Required for LIMIT, STOP_LIMIT and LIMIT_ON_CLOSE orders.
         stop_price: Required for STOP and STOP_LIMIT orders.
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         equity_market_session: CORE or EXTENDED.
@@ -3191,9 +3201,11 @@ async def flatten_and_go_short(
     Args:
         symbol: Ticker symbol (e.g. "AAPL").
         short_quantity: Number of shares to short after flattening.
-        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT. Default is MARKET.
+        order_type: MARKET, LIMIT, STOP, STOP_LIMIT, MARKET_ON_CLOSE or
+            LIMIT_ON_CLOSE. Default is MARKET. The on-close types execute at the
+            closing auction.
         time_in_force: DAY or GTD. Default is DAY.
-        limit_price: Required for LIMIT and STOP_LIMIT orders.
+        limit_price: Required for LIMIT, STOP_LIMIT and LIMIT_ON_CLOSE orders.
         stop_price: Required for STOP and STOP_LIMIT orders.
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         equity_market_session: CORE or EXTENDED.
@@ -3334,13 +3346,15 @@ async def cancel_and_replace_order(
 
     Args:
         order_id: UUID of the existing order to cancel and replace.
-        order_type: MARKET, LIMIT, STOP, or STOP_LIMIT for the replacement.
+        order_type: MARKET, LIMIT, STOP, STOP_LIMIT, MARKET_ON_CLOSE or
+            LIMIT_ON_CLOSE for the replacement.
         time_in_force: DAY or GTD. Default is DAY.
         quantity: New quantity for the replacement order. Mutually exclusive
             with amount.
         amount: New notional dollar amount for the replacement order.
             Mutually exclusive with quantity.
-        limit_price: New limit price (for LIMIT/STOP_LIMIT orders).
+        limit_price: New limit price. Required for LIMIT, STOP_LIMIT and
+            LIMIT_ON_CLOSE replacements.
         stop_price: New stop price (for STOP/STOP_LIMIT orders).
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
