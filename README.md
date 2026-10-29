@@ -16,9 +16,9 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 |------|-------------|
 | `check_setup` | Verify API credentials and connectivity |
 | `get_accounts` | List all brokerage accounts |
-| `get_portfolio` | View positions, equity, buying power, open orders |
+| `get_portfolio` | View positions, equity, buying power (including `dayTradeBuyingPower`), open orders |
 | `get_orders` | List active/open orders (bracket legs share a `bracketId`) |
-| `get_order` | Status and details of a specific order, including its fills (`trades`, `filledAt`, `replacedAt`, `lastModified`); last 30 days |
+| `get_order` | Status and details of a specific order, including its fills (`trades` with each fill's venue MIC, `filledAt`, `replacedAt`, `lastModified`); last 30 days |
 | `search_orders` | Search order history — any status, last 30 days, up to 500 orders, filtered by status/side/symbols/type/time |
 | `get_history` | Transaction history (trades, deposits, dividends, etc.) |
 | `get_quotes` | Real-time quotes for stocks, crypto, options, event contracts |
@@ -37,7 +37,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `get_strategy_quote` | Consolidated quote for a multi-leg option strategy |
 | `get_event_categories` | Event-contract (prediction market) categories, subcategories and frequency filters |
 | `get_event_summary` | Browse event contracts by category / symbol / frequency / resolution time, 100 per page |
-| `get_event_details` | One event's outcomes, YES/NO contract prices, timeline and CFTC terms, plus per-outcome `tradable` / `secondsLeft` / `winner` |
+| `get_event_details` | One event's outcomes (with `floorStrike`), YES/NO contract prices, timeline and CFTC terms, plus per-outcome `tradable` / `secondsLeft` / `winner` |
 | `get_event_contract_bars` | Price-history bars for up to 8 contracts of one event |
 | `get_current_event` | The window of a recurring market (e.g. 15-minute `KXBTC15M`) trading right now; optional bounded wait |
 | `wait_for_settlement` | Wait (bounded) for an event outcome to settle and report the winning contract |
@@ -54,7 +54,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 
 | Tool | Description |
 |------|-------------|
-| `place_order` | Place a single-leg order (stocks, crypto, options); optionally a bracket order via `order_class` + exit-leg prices, or target specific tax lots via `tax_lot_matching_instructions` |
+| `place_order` | Place a single-leg order (stocks, crypto, options), including market-on-close / limit-on-close; optionally a bracket order via `order_class` + exit-leg prices, or target specific tax lots via `tax_lot_matching_instructions` |
 | `place_multileg_order` | Place multi-leg orders (spreads, straddles, etc.) |
 | `place_call_credit_spread` | Place a Bear Call Spread |
 | `place_call_debit_spread` | Place a Bull Call Spread |
@@ -65,6 +65,24 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `flatten_and_go_short` | Sell an existing long position then go short (experimental) |
 | `cancel_order` | Cancel an existing order |
 | `cancel_and_replace_order` | Atomically cancel and replace an order |
+
+### Order types
+
+`place_order`, `preflight_order`, `cancel_and_replace_order` and the short-sale tools
+take `order_type` as one of:
+
+| `order_type` | Price arguments |
+|------|-------------|
+| `MARKET` | none |
+| `LIMIT` | `limit_price` |
+| `STOP` | `stop_price` |
+| `STOP_LIMIT` | `stop_price` and `limit_price` |
+| `MARKET_ON_CLOSE` | none — executes at the closing auction |
+| `LIMIT_ON_CLOSE` | `limit_price` — executes at the closing auction |
+
+`place_order`, `preflight_order` and the short-sale tools also reject a price argument
+the order type doesn't take (e.g. `limit_price` on `MARKET_ON_CLOSE`). Bracket entries
+are `LIMIT` or `MARKET` only, and multi-leg orders are always `LIMIT`.
 
 ### Bracket orders
 
@@ -99,7 +117,9 @@ else use the order-history tools:
 
 Both are limited by the API to orders created within the **last 30 days**, and
 `search_orders` returns at most **500** orders. Each order includes `trades` (the
-individual fills), `filledAt`, `replacedAt`, `lastModified` and `equityMarketSession`.
+individual fills, each with the `marketIdentificationCode` — the ISO 10383 MIC of the
+execution venue, e.g. `XNAS` — when reported), `filledAt`, `replacedAt`, `lastModified`
+and `equityMarketSession`.
 Note that `equityMarketSession` uses `REGULAR` / `REST_OF_DAY` / `TWENTY_FOUR_HOURS`,
 which is not the `CORE` / `EXTENDED` / `TWENTY_FOUR_HOURS` vocabulary that
 `place_order`'s `equity_market_session` argument takes.
