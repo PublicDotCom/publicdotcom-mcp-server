@@ -3,12 +3,12 @@
   "name": "io.github.publicdotcom/publicdotcom-mcp-server",
   "title": "Public.com Trading API",
   "description": "Connect AI assistants to your Public.com brokerage account. Trade stocks, options, and crypto — get quotes, manage orders, and view your portfolio.",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "packages": [
     {
       "registryType": "pip",
       "identifier": "publicdotcom-mcp-server",
-      "version": "0.10.0",
+      "version": "0.11.0",
       "transport": {
         "type": "stdio"
       },
@@ -21,6 +21,26 @@
         {
           "name": "PUBLIC_COM_ACCOUNT_ID",
           "description": "Default account ID. Optional — if not set, the server will prompt for it.",
+          "required": false
+        },
+        {
+          "name": "PUBLIC_COM_ORDER_CONFIRMATION",
+          "description": "How orders are confirmed: auto (default) asks the user through MCP elicitation when the client supports it; required refuses orders from clients that cannot ask; off never asks.",
+          "required": false
+        },
+        {
+          "name": "PUBLIC_COM_MAX_ORDER_QUANTITY",
+          "description": "Optional. Refuse any order for more shares or contracts than this.",
+          "required": false
+        },
+        {
+          "name": "PUBLIC_COM_MAX_ORDER_VALUE",
+          "description": "Optional. Refuse any order whose preflight order value, estimated cost or buying power requirement is over this many dollars.",
+          "required": false
+        },
+        {
+          "name": "PUBLIC_COM_READ_ONLY",
+          "description": "Optional. Set to true to remove every order-placing and cancelling tool.",
           "required": false
         }
       ]

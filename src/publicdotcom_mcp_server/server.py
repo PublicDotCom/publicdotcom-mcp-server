@@ -13,14 +13,15 @@ Requires:
 import json
 import logging
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 # ---------------------------------------------------------------------------
 # SDK import — installed via `pip install publicdotcom-py`
@@ -113,7 +114,10 @@ mcp = FastMCP(
         "portfolio, get quotes, place/cancel orders, search order history, look up "
         "instruments, work with options, and browse and buy event contracts "
         "(prediction markets) — all through a Public.com "
-        "brokerage account. Requires a PUBLIC_COM_SECRET environment variable."
+        "brokerage account. Requires a PUBLIC_COM_SECRET environment variable. "
+        "Every order tool preflights its order before submitting it and asks the "
+        "user to confirm when the client supports it; an order the server refuses "
+        "comes back with \"submitted\": false and was not sent."
     ),
 )
 
@@ -352,6 +356,307 @@ def _build_bracket_kwargs(
             stop_loss_kwargs["limit_price"] = Decimal(stop_loss_limit_price)
         kwargs["stop_loss"] = StopLoss(**stop_loss_kwargs)
     return kwargs
+
+
+def _single_leg_order_kwargs(
+    *,
+    symbol: str,
+    instrument_type: str,
+    order_side: str,
+    order_type: str,
+    time_in_force: str,
+    quantity: str | None,
+    amount: str | None,
+    limit_price: str | None,
+    stop_price: str | None,
+    open_close_indicator: str | None,
+    expiration_time: str | None,
+    equity_market_session: str | None,
+    tax_lot_matching_instructions: list[dict] | None,
+) -> dict[str, Any]:
+    """Build the fields shared by PreflightRequest and OrderRequest.
+
+    preflight_order and place_order both build from this, so the preflight the
+    order gate runs is always of the exact order that place_order submits.
+    """
+    from datetime import datetime as dt
+
+    exp_kwargs: dict[str, Any] = {"time_in_force": TimeInForce(time_in_force.upper())}
+    if expiration_time:
+        exp_kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+    req_kwargs: dict[str, Any] = {
+        "instrument": OrderInstrument(symbol=symbol, type=_parse_instrument_type(instrument_type)),
+        "order_side": OrderSide(order_side.upper()),
+        "order_type": OrderType(order_type.upper()),
+        "expiration": OrderExpirationRequest(**exp_kwargs),
+    }
+    if quantity is not None:
+        req_kwargs["quantity"] = Decimal(quantity)
+    if amount is not None:
+        req_kwargs["amount"] = Decimal(amount)
+    if limit_price is not None:
+        req_kwargs["limit_price"] = Decimal(limit_price)
+    if stop_price is not None:
+        req_kwargs["stop_price"] = Decimal(stop_price)
+    if open_close_indicator:
+        req_kwargs["open_close_indicator"] = OpenCloseIndicator(open_close_indicator.upper())
+    if equity_market_session:
+        req_kwargs["equity_market_session"] = EquityMarketSession(equity_market_session.upper())
+    if tax_lot_matching_instructions:
+        req_kwargs["tax_lot_matching_instructions"] = [
+            GatewayTaxLotMatchingInstruction(**d) for d in tax_lot_matching_instructions
+        ]
+    return req_kwargs
+
+
+# ---------------------------------------------------------------------------
+# Order gate
+#
+# Every tool that opens or enlarges a position calls _gate_order before it
+# sends anything to the trading API. The gate:
+#   1. checks the order against the operator's limits (env vars, set outside
+#      the chat, so the model cannot change them);
+#   2. runs a preflight of the exact order, and refuses to submit if the
+#      preflight fails or its estimate breaks a limit;
+#   3. asks the user to confirm through MCP elicitation, which the client shows
+#      to the user and the model cannot answer for them.
+# None of this replaces the client's own tool-approval prompt; it backs it up
+# for clients where that prompt is off ("always allow") or missing.
+# ---------------------------------------------------------------------------
+
+_CONFIRMATION_MODES = ("auto", "required", "off")
+
+
+@dataclass(frozen=True)
+class _OrderPolicy:
+    max_quantity: Decimal | None
+    max_value: Decimal | None
+    confirmation: str
+
+
+def _env_decimal(name: str) -> Decimal | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = Decimal(raw)
+    except Exception:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
+    if not value.is_finite() or value <= 0:
+        raise ValueError(f"{name} must be a positive number, got {raw!r}")
+    return value
+
+
+def _load_order_policy() -> _OrderPolicy:
+    """Read the order limits from the environment on every call.
+
+    A malformed value raises, which blocks the order: an operator who set a
+    limit wants it enforced, so a typo must not silently turn it off.
+    """
+    confirmation = os.environ.get("PUBLIC_COM_ORDER_CONFIRMATION", "auto").strip().lower()
+    if confirmation not in _CONFIRMATION_MODES:
+        raise ValueError(
+            f"PUBLIC_COM_ORDER_CONFIRMATION must be one of {', '.join(_CONFIRMATION_MODES)}, "
+            f"got {confirmation!r}"
+        )
+    return _OrderPolicy(
+        max_quantity=_env_decimal("PUBLIC_COM_MAX_ORDER_QUANTITY"),
+        max_value=_env_decimal("PUBLIC_COM_MAX_ORDER_VALUE"),
+        confirmation=confirmation,
+    )
+
+
+class _OrderBlocked(Exception):
+    """The order gate stopped an order before it reached the trading API."""
+
+    def __init__(self, status: str, message: str, preflight: dict[str, str] | None = None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.preflight = preflight
+
+    def to_json(self) -> str:
+        data: dict[str, Any] = {
+            "status": self.status,
+            "submitted": False,
+            "message": f"{self.message} No order was sent to Public.com.",
+        }
+        if self.preflight:
+            data["preflight"] = self.preflight
+        return json.dumps(data, indent=2)
+
+
+# Preflight fields shown to the user and returned with the order. Single-leg and
+# multi-leg preflight responses share these names.
+_ESTIMATE_FIELDS = (
+    ("order_value", "orderValue"),
+    ("estimated_cost", "estimatedCost"),
+    ("estimated_proceeds", "estimatedProceeds"),
+    ("buying_power_requirement", "buyingPowerRequirement"),
+    ("estimated_commission", "estimatedCommission"),
+)
+# The fields whose size the PUBLIC_COM_MAX_ORDER_VALUE limit bounds. The buying
+# power requirement is what makes the limit bite on a sell-to-open option or a
+# short sale, whose order value is only the premium or proceeds received.
+_EXPOSURE_FIELDS = ("orderValue", "estimatedCost", "buyingPowerRequirement")
+
+
+def _preflight_estimate(result: Any) -> dict[str, Decimal]:
+    estimate: dict[str, Decimal] = {}
+    for attr, key in _ESTIMATE_FIELDS:
+        value = getattr(result, attr, None)
+        if isinstance(value, (Decimal, int)) and not isinstance(value, bool):
+            estimate[key] = Decimal(value)
+    return estimate
+
+
+class _OrderConfirmation(BaseModel):
+    confirm: bool = Field(description="Place this order now")
+
+
+def _client_supports_elicitation(ctx: Context | None) -> bool:
+    if ctx is None:
+        return False
+    try:
+        params = ctx.session.client_params
+    except Exception:
+        return False
+    return bool(params and params.capabilities and params.capabilities.elicitation is not None)
+
+
+async def _confirm_order(
+    ctx: Context | None, mode: str, summary: list[str], estimate: dict[str, str]
+) -> str:
+    """Ask the user to confirm the order. Returns how the order was confirmed."""
+    if mode == "off":
+        return "disabled"
+    if not _client_supports_elicitation(ctx):
+        if mode == "required":
+            raise _OrderBlocked(
+                "confirmation_unavailable",
+                "This server requires the user to confirm each order "
+                "(PUBLIC_COM_ORDER_CONFIRMATION=required), but this client cannot show "
+                "a confirmation prompt.",
+                estimate,
+            )
+        return "client_tool_approval"
+
+    lines = ["Confirm this order:", *(f"  {line}" for line in summary)]
+    if estimate:
+        lines.append("Preflight estimate:")
+        lines.extend(f"  {key}: {value}" for key, value in estimate.items())
+    try:
+        result = await ctx.elicit(message="\n".join(lines), schema=_OrderConfirmation)
+    except Exception as e:
+        raise _OrderBlocked(
+            "confirmation_failed", f"Could not get the user's confirmation: {e}.", estimate
+        ) from e
+    if result.action == "accept" and result.data is not None and result.data.confirm:
+        return "user_confirmed"
+    raise _OrderBlocked(
+        "not_confirmed",
+        "The user did not confirm this order. Do not place it again unless the user asks.",
+        estimate,
+    )
+
+
+async def _gate_order(
+    ctx: Context | None,
+    *,
+    summary: list[str],
+    quantity: Decimal | None,
+    run_preflight: Callable[[], Awaitable[Any]],
+    enforce_value_limit: bool = True,
+    confirm: bool = True,
+) -> dict[str, Any]:
+    """Run the limit checks, the preflight and the confirmation for one order.
+
+    Returns the fields to add to the tool's success response. Raises
+    _OrderBlocked when the order must not be submitted.
+
+    `quantity` is the largest number of shares or contracts any leg of the order
+    trades, or None for a dollar-amount order (the value limit covers those).
+
+    The two switches exist for flatten_and_go_short, which gates two orders:
+    `enforce_value_limit=False` for the flatten, which only closes a position
+    (a value limit must never stop a user getting out), and `confirm=False` for
+    the short that follows it, which the user already confirmed as part of the
+    workflow.
+    """
+    try:
+        policy = _load_order_policy()
+    except ValueError as e:
+        raise _OrderBlocked("configuration_error", f"Order limits are misconfigured: {e}.") from e
+
+    if policy.max_quantity is not None and quantity is not None and quantity > policy.max_quantity:
+        raise _OrderBlocked(
+            "blocked_by_limit",
+            f"Quantity {quantity} is over this server's limit of {policy.max_quantity} "
+            "(PUBLIC_COM_MAX_ORDER_QUANTITY).",
+        )
+
+    try:
+        result = await run_preflight()
+    except Exception as e:
+        raise _OrderBlocked("preflight_failed", f"The preflight check rejected this order: {e}.") from e
+
+    estimate = _preflight_estimate(result)
+    shown = {key: str(value) for key, value in estimate.items()}
+
+    if enforce_value_limit and policy.max_value is not None:
+        exposures = [abs(estimate[key]) for key in _EXPOSURE_FIELDS if key in estimate]
+        if not exposures:
+            raise _OrderBlocked(
+                "blocked_by_limit",
+                "The preflight did not return an order value or buying power requirement, "
+                "so the PUBLIC_COM_MAX_ORDER_VALUE limit cannot be checked.",
+                shown,
+            )
+        if max(exposures) > policy.max_value:
+            raise _OrderBlocked(
+                "blocked_by_limit",
+                f"This order's estimated value or buying power requirement ({max(exposures)}) "
+                f"is over this server's limit of {policy.max_value} (PUBLIC_COM_MAX_ORDER_VALUE).",
+                shown,
+            )
+
+    if not confirm:
+        return {"preflight": shown}
+    confirmation = await _confirm_order(ctx, policy.confirmation, summary, shown)
+    return {"preflight": shown, "confirmation": confirmation}
+
+
+def _order_terms(
+    order_type: str,
+    limit_price: Any = None,
+    stop_price: Any = None,
+    time_in_force: str = "DAY",
+) -> str:
+    terms = order_type.upper()
+    if limit_price is not None:
+        terms += f", limit {limit_price}"
+    if stop_price is not None:
+        terms += f", stop {stop_price}"
+    return f"{terms}, {time_in_force.upper()}"
+
+
+def _long_equity_quantity(portfolio: Any, symbol: str) -> Decimal:
+    """Total equity shares of `symbol` held, as the SDK's flatten_and_go_short counts them."""
+    total = Decimal("0")
+    for position in portfolio.positions or []:
+        instrument = position.instrument
+        if (
+            instrument.symbol.strip().upper() == symbol
+            and instrument.type == InstrumentType.EQUITY
+        ):
+            total += position.quantity
+    return total
+
+
+def _account_line(account_id: str | None) -> str:
+    acct = account_id or _account_id.get() or os.environ.get("PUBLIC_COM_ACCOUNT_ID") or "default"
+    return f"Account: {acct}"
 
 
 def _parse_timestamp(field_name: str, raw: str):
@@ -2024,8 +2329,6 @@ async def preflight_order(
             broker apply its default lot-matching.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
-    from datetime import datetime as dt
-
     try:
         _validate_order_params(
             quantity=quantity,
@@ -2038,41 +2341,23 @@ async def preflight_order(
             time_in_force=time_in_force,
             expiration_time=expiration_time,
         )
-
-        exp_kwargs: dict[str, Any] = {"time_in_force": TimeInForce(time_in_force.upper())}
-        if expiration_time:
-            exp_kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
-
-        req_kwargs: dict[str, Any] = {
-            "instrument": OrderInstrument(
-                symbol=symbol, type=_parse_instrument_type(instrument_type)
-            ),
-            "order_side": OrderSide(order_side.upper()),
-            "order_type": OrderType(order_type.upper()),
-            "expiration": OrderExpirationRequest(**exp_kwargs),
-        }
-        if quantity is not None:
-            req_kwargs["quantity"] = Decimal(quantity)
-        if amount is not None:
-            req_kwargs["amount"] = Decimal(amount)
-        if limit_price is not None:
-            req_kwargs["limit_price"] = Decimal(limit_price)
-        if stop_price is not None:
-            req_kwargs["stop_price"] = Decimal(stop_price)
-        if open_close_indicator:
-            req_kwargs["open_close_indicator"] = OpenCloseIndicator(
-                open_close_indicator.upper()
+        req = PreflightRequest(
+            **_single_leg_order_kwargs(
+                symbol=symbol,
+                instrument_type=instrument_type,
+                order_side=order_side,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                quantity=quantity,
+                amount=amount,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                open_close_indicator=open_close_indicator,
+                expiration_time=expiration_time,
+                equity_market_session=equity_market_session,
+                tax_lot_matching_instructions=tax_lot_matching_instructions,
             )
-        if equity_market_session:
-            req_kwargs["equity_market_session"] = EquityMarketSession(
-                equity_market_session.upper()
-            )
-        if tax_lot_matching_instructions:
-            req_kwargs["tax_lot_matching_instructions"] = [
-                GatewayTaxLotMatchingInstruction(**d) for d in tax_lot_matching_instructions
-            ]
-
-        req = PreflightRequest(**req_kwargs)
+        )
         async with _get_client(account_id) as client:
             result = await client.perform_preflight_calculation(
                 preflight_request=req, account_id=account_id
@@ -2535,11 +2820,17 @@ async def place_order(
     stop_loss_stop_price: str | None = None,
     stop_loss_limit_price: str | None = None,
     account_id: str | None = None,
+    # Typed `Context` rather than `Context | None`: older mcp releases only
+    # recognise (and hide from the tool schema) a bare Context annotation.
+    ctx: Context = None,
 ) -> str:
     """
     Place a single-leg order (buy/sell stocks, crypto, or options).
 
-    ⚠️ This executes a real trade. Consider running preflight_order first.
+    ⚠️ This executes a real trade. Before submitting, the server preflights this
+    exact order and refuses it if the preflight fails or breaks a configured
+    limit; when the client supports it, the user is asked to confirm. A refused
+    order comes back with "submitted": false and is not sent.
 
     Args:
         symbol: Ticker symbol (e.g. "AAPL").
@@ -2584,8 +2875,6 @@ async def place_order(
             stop_loss_stop_price.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
-    from datetime import datetime as dt
-
     order_id = str(uuid4())
 
     try:
@@ -2600,55 +2889,63 @@ async def place_order(
             time_in_force=time_in_force,
             expiration_time=expiration_time,
         )
-
-        exp_kwargs: dict[str, Any] = {"time_in_force": TimeInForce(time_in_force.upper())}
-        if expiration_time:
-            exp_kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
-
-        req_kwargs: dict[str, Any] = {
-            "order_id": order_id,
-            "instrument": OrderInstrument(
-                symbol=symbol, type=_parse_instrument_type(instrument_type)
-            ),
-            "order_side": OrderSide(order_side.upper()),
-            "order_type": OrderType(order_type.upper()),
-            "expiration": OrderExpirationRequest(**exp_kwargs),
-        }
-        if quantity is not None:
-            req_kwargs["quantity"] = Decimal(quantity)
-        if amount is not None:
-            req_kwargs["amount"] = Decimal(amount)
-        if limit_price is not None:
-            req_kwargs["limit_price"] = Decimal(limit_price)
-        if stop_price is not None:
-            req_kwargs["stop_price"] = Decimal(stop_price)
-        if open_close_indicator:
-            req_kwargs["open_close_indicator"] = OpenCloseIndicator(
-                open_close_indicator.upper()
-            )
-        if equity_market_session:
-            req_kwargs["equity_market_session"] = EquityMarketSession(
-                equity_market_session.upper()
-            )
-        if tax_lot_matching_instructions:
-            req_kwargs["tax_lot_matching_instructions"] = [
-                GatewayTaxLotMatchingInstruction(**d) for d in tax_lot_matching_instructions
-            ]
-        req_kwargs.update(
-            _build_bracket_kwargs(
+        order_kwargs = _single_leg_order_kwargs(
+            symbol=symbol,
+            instrument_type=instrument_type,
+            order_side=order_side,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            quantity=quantity,
+            amount=amount,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            open_close_indicator=open_close_indicator,
+            expiration_time=expiration_time,
+            equity_market_session=equity_market_session,
+            tax_lot_matching_instructions=tax_lot_matching_instructions,
+        )
+        # Built before the gate so a malformed bracket fails fast, without a
+        # preflight or a confirmation prompt for an order that cannot be placed.
+        req = OrderRequest(
+            order_id=order_id,
+            **order_kwargs,
+            **_build_bracket_kwargs(
                 order_class=order_class,
                 take_profit_limit_price=take_profit_limit_price,
                 stop_loss_stop_price=stop_loss_stop_price,
                 stop_loss_limit_price=stop_loss_limit_price,
-            )
+            ),
         )
 
-        req = OrderRequest(**req_kwargs)
-        logger.info(
-            "Placing order: order_id=%s symbol=%s side=%s type=%s qty=%s amount=%s class=%s",
-            order_id, symbol, order_side, order_type, quantity, amount, order_class,
-        )
+        size = f"{quantity}" if quantity is not None else f"${amount} of"
+        summary = [
+            f"{order_side.upper()} {size} {symbol} ({instrument_type.upper()}"
+            + (f", {open_close_indicator.upper()}" if open_close_indicator else "")
+            + ")",
+            _order_terms(order_type, limit_price, stop_price, time_in_force),
+        ]
+        if order_class and order_class.upper() != "SIMPLE":
+            summary.append(
+                f"{order_class.upper()} bracket: take profit {take_profit_limit_price}, "
+                f"stop loss {stop_loss_stop_price}"
+                + (f" (limit {stop_loss_limit_price})" if stop_loss_limit_price else "")
+                + " — the preflight covers the entry order only"
+            )
+        summary.append(_account_line(account_id))
+
         async with _get_client(account_id) as client:
+            gate = await _gate_order(
+                ctx,
+                summary=summary,
+                quantity=Decimal(quantity) if quantity is not None else None,
+                run_preflight=lambda: client.perform_preflight_calculation(
+                    preflight_request=PreflightRequest(**order_kwargs), account_id=account_id
+                ),
+            )
+            logger.info(
+                "Placing order: order_id=%s symbol=%s side=%s type=%s qty=%s amount=%s class=%s",
+                order_id, symbol, order_side, order_type, quantity, amount, order_class,
+            )
             new_order = await client.place_order(
                 order_request=req, account_id=account_id
             )
@@ -2657,6 +2954,7 @@ async def place_order(
             {
                 "order_id": new_order.order_id,
                 "status": "submitted",
+                **gate,
                 "message": (
                     "Order submitted. Placement is asynchronous — use "
                     "get_order to confirm status."
@@ -2664,6 +2962,9 @@ async def place_order(
             },
             indent=2,
         )
+    except _OrderBlocked as blocked:
+        logger.warning("place_order blocked (order_id=%s): %s", order_id, blocked.status)
+        return blocked.to_json()
     except Exception as e:
         logger.error("place_order failed (order_id=%s): %s", order_id, e, exc_info=True)
         return json.dumps(
@@ -2695,11 +2996,15 @@ async def place_multileg_order(
     time_in_force: str = "DAY",
     expiration_time: str | None = None,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Place a multi-leg order (options strategies: spreads, straddles, etc.).
 
-    ⚠️ This executes a real trade. Consider running preflight_multileg_order first.
+    ⚠️ This executes a real trade. Before submitting, the server preflights this
+    exact order and refuses it if the preflight fails or breaks a configured
+    limit; when the client supports it, the user is asked to confirm. A refused
+    order comes back with "submitted": false and is not sent.
 
     Args:
         legs: List of leg objects. Each leg must have:
@@ -2736,9 +3041,8 @@ async def place_multileg_order(
 
         # `legs` is list[OrderLeg] when invoked via MCP/Pydantic; when invoked
         # directly in tests it may be list[dict]. model_validate handles both.
-        leg_requests = [
-            _build_leg_request(OrderLeg.model_validate(leg)) for leg in legs
-        ]
+        parsed_legs = [OrderLeg.model_validate(leg) for leg in legs]
+        leg_requests = [_build_leg_request(leg) for leg in parsed_legs]
 
         req = MultilegOrderRequest(
             order_id=order_id,
@@ -2748,11 +3052,41 @@ async def place_multileg_order(
             expiration=OrderExpirationRequest(**exp_kwargs),
             legs=leg_requests,
         )
-        logger.info(
-            "Placing multileg order: order_id=%s legs=%d qty=%d limit=%s",
-            order_id, len(legs), quantity, limit_price,
+        preflight_req = PreflightMultiLegRequest(
+            order_type=OrderType.LIMIT,
+            expiration=OrderExpirationRequest(**exp_kwargs),
+            limit_price=Decimal(limit_price),
+            legs=leg_requests,
+            quantity=quantity,
         )
+        summary = [
+            f"{quantity} x {len(parsed_legs)}-leg order, net limit {limit_price} "
+            "(positive = debit, negative = credit)",
+            *(
+                f"Leg: {leg.side} {leg.ratio_quantity or 1} {leg.symbol} ({leg.type}"
+                + (f", {leg.open_close_indicator}" if leg.open_close_indicator else "")
+                + ")"
+                for leg in parsed_legs
+            ),
+            time_in_force.upper(),
+            _account_line(account_id),
+        ]
+        # The quantity limit applies to the contracts traded on the biggest leg.
+        max_ratio = max((leg.ratio_quantity or 1 for leg in parsed_legs), default=1)
+
         async with _get_client(account_id) as client:
+            gate = await _gate_order(
+                ctx,
+                summary=summary,
+                quantity=Decimal(quantity) * max_ratio,
+                run_preflight=lambda: client.perform_multi_leg_preflight_calculation(
+                    preflight_request=preflight_req, account_id=account_id
+                ),
+            )
+            logger.info(
+                "Placing multileg order: order_id=%s legs=%d qty=%d limit=%s",
+                order_id, len(legs), quantity, limit_price,
+            )
             new_order = await client.place_multileg_order(
                 order_request=req, account_id=account_id
             )
@@ -2761,6 +3095,7 @@ async def place_multileg_order(
             {
                 "order_id": new_order.order_id,
                 "status": "submitted",
+                **gate,
                 "message": (
                     "Multi-leg order submitted. Placement is asynchronous — "
                     "use get_order to confirm status."
@@ -2768,6 +3103,9 @@ async def place_multileg_order(
             },
             indent=2,
         )
+    except _OrderBlocked as blocked:
+        logger.warning("place_multileg_order blocked (order_id=%s): %s", order_id, blocked.status)
+        return blocked.to_json()
     except Exception as e:
         logger.error("place_multileg_order failed (order_id=%s): %s", order_id, e, exc_info=True)
         return json.dumps(
@@ -2779,6 +3117,89 @@ async def place_multileg_order(
                     f"Use get_order({order_id!r}) to check if the order was accepted."
                 ),
             },
+            indent=2,
+        )
+
+
+_SPREAD_NAMES = {
+    "call_credit": "Bear Call Spread (call credit)",
+    "call_debit": "Bull Call Spread (call debit)",
+    "put_credit": "Bull Put Spread (put credit)",
+    "put_debit": "Bear Put Spread (put debit)",
+}
+
+
+async def _place_vertical_spread(
+    kind: str,
+    ctx: Context | None,
+    *,
+    sell_contract_osi: str,
+    buy_contract_osi: str,
+    quantity: int,
+    limit_price: str,
+    time_in_force: str,
+    expiration_time: str | None,
+    account_id: str | None,
+) -> str:
+    """Gate and place one of the four vertical spreads.
+
+    `kind` names the SDK's place_<kind>_spread / preflight_<kind>_spread pair.
+    """
+    from datetime import datetime as dt
+
+    tool = f"place_{kind}_spread"
+    order_id = str(uuid4())
+    try:
+        kwargs: dict[str, Any] = {
+            "sell_contract_osi": sell_contract_osi,
+            "buy_contract_osi": buy_contract_osi,
+            "quantity": quantity,
+            "limit_price": Decimal(limit_price),
+            "time_in_force": TimeInForce(time_in_force.upper()),
+        }
+        if expiration_time:
+            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+
+        summary = [
+            f"{quantity} x {_SPREAD_NAMES[kind]}, net limit {limit_price}",
+            f"Sell {sell_contract_osi}",
+            f"Buy {buy_contract_osi}",
+            time_in_force.upper(),
+            _account_line(account_id),
+        ]
+        async with _get_client(account_id) as client:
+            preflight = getattr(client, f"preflight_{kind}_spread")
+            gate = await _gate_order(
+                ctx,
+                summary=summary,
+                quantity=Decimal(quantity),
+                run_preflight=lambda: preflight(account_id=account_id, **kwargs),
+            )
+            logger.info(
+                "Placing %s spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
+                kind.replace("_", " "), order_id, sell_contract_osi, buy_contract_osi,
+                quantity, limit_price,
+            )
+            new_order = await getattr(client, tool)(
+                account_id=account_id, order_id=order_id, **kwargs
+            )
+        logger.info("%s accepted: order_id=%s returned=%s", tool, order_id, new_order.order_id)
+        return json.dumps(
+            {
+                "order_id": new_order.order_id,
+                "status": "submitted",
+                **gate,
+                "message": "Order submitted. Use get_order to confirm status.",
+            },
+            indent=2,
+        )
+    except _OrderBlocked as blocked:
+        logger.warning("%s blocked (order_id=%s): %s", tool, order_id, blocked.status)
+        return blocked.to_json()
+    except Exception as e:
+        logger.error("%s failed (order_id=%s): %s", tool, order_id, e, exc_info=True)
+        return json.dumps(
+            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
             indent=2,
         )
 
@@ -2800,12 +3221,16 @@ async def place_call_credit_spread(
     time_in_force: str = "DAY",
     expiration_time: str | None = None,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Place a Bear Call Spread (call credit spread).
 
     Sell a lower-strike call, buy a higher-strike call. Receives a net credit.
-    ⚠️ This executes a real trade. Consider running preflight_call_credit_spread first.
+    ⚠️ This executes a real trade. Before submitting, the server preflights this
+    exact spread and refuses it if the preflight fails or breaks a configured
+    limit; when the client supports it, the user is asked to confirm. A refused
+    order comes back with "submitted": false and is not sent.
 
     Args:
         sell_contract_osi: OSI symbol of the call to sell (lower strike).
@@ -2816,42 +3241,17 @@ async def place_call_credit_spread(
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
-    from datetime import datetime as dt
-
-    order_id = str(uuid4())
-    try:
-        kwargs: dict[str, Any] = {
-            "sell_contract_osi": sell_contract_osi,
-            "buy_contract_osi": buy_contract_osi,
-            "quantity": quantity,
-            "limit_price": Decimal(limit_price),
-            "order_id": order_id,
-            "time_in_force": TimeInForce(time_in_force.upper()),
-        }
-        if expiration_time:
-            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
-
-        logger.info(
-            "Placing call credit spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
-            order_id, sell_contract_osi, buy_contract_osi, quantity, limit_price,
-        )
-        async with _get_client(account_id) as client:
-            new_order = await client.place_call_credit_spread(account_id=account_id, **kwargs)
-        logger.info("Call credit spread accepted: order_id=%s returned=%s", order_id, new_order.order_id)
-        return json.dumps(
-            {
-                "order_id": new_order.order_id,
-                "status": "submitted",
-                "message": "Order submitted. Use get_order to confirm status.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        logger.error("place_call_credit_spread failed (order_id=%s): %s", order_id, e, exc_info=True)
-        return json.dumps(
-            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
-            indent=2,
-        )
+    return await _place_vertical_spread(
+        "call_credit",
+        ctx,
+        sell_contract_osi=sell_contract_osi,
+        buy_contract_osi=buy_contract_osi,
+        quantity=quantity,
+        limit_price=limit_price,
+        time_in_force=time_in_force,
+        expiration_time=expiration_time,
+        account_id=account_id,
+    )
 
 
 @mcp.tool(
@@ -2871,12 +3271,16 @@ async def place_call_debit_spread(
     time_in_force: str = "DAY",
     expiration_time: str | None = None,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Place a Bull Call Spread (call debit spread).
 
     Buy a lower-strike call, sell a higher-strike call. Pays a net debit.
-    ⚠️ This executes a real trade. Consider running preflight_call_debit_spread first.
+    ⚠️ This executes a real trade. Before submitting, the server preflights this
+    exact spread and refuses it if the preflight fails or breaks a configured
+    limit; when the client supports it, the user is asked to confirm. A refused
+    order comes back with "submitted": false and is not sent.
 
     Args:
         sell_contract_osi: OSI symbol of the call to sell (higher strike).
@@ -2887,42 +3291,17 @@ async def place_call_debit_spread(
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
-    from datetime import datetime as dt
-
-    order_id = str(uuid4())
-    try:
-        kwargs: dict[str, Any] = {
-            "sell_contract_osi": sell_contract_osi,
-            "buy_contract_osi": buy_contract_osi,
-            "quantity": quantity,
-            "limit_price": Decimal(limit_price),
-            "order_id": order_id,
-            "time_in_force": TimeInForce(time_in_force.upper()),
-        }
-        if expiration_time:
-            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
-
-        logger.info(
-            "Placing call debit spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
-            order_id, sell_contract_osi, buy_contract_osi, quantity, limit_price,
-        )
-        async with _get_client(account_id) as client:
-            new_order = await client.place_call_debit_spread(account_id=account_id, **kwargs)
-        logger.info("Call debit spread accepted: order_id=%s returned=%s", order_id, new_order.order_id)
-        return json.dumps(
-            {
-                "order_id": new_order.order_id,
-                "status": "submitted",
-                "message": "Order submitted. Use get_order to confirm status.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        logger.error("place_call_debit_spread failed (order_id=%s): %s", order_id, e, exc_info=True)
-        return json.dumps(
-            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
-            indent=2,
-        )
+    return await _place_vertical_spread(
+        "call_debit",
+        ctx,
+        sell_contract_osi=sell_contract_osi,
+        buy_contract_osi=buy_contract_osi,
+        quantity=quantity,
+        limit_price=limit_price,
+        time_in_force=time_in_force,
+        expiration_time=expiration_time,
+        account_id=account_id,
+    )
 
 
 @mcp.tool(
@@ -2942,12 +3321,16 @@ async def place_put_credit_spread(
     time_in_force: str = "DAY",
     expiration_time: str | None = None,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Place a Bull Put Spread (put credit spread).
 
     Sell a higher-strike put, buy a lower-strike put. Receives a net credit.
-    ⚠️ This executes a real trade. Consider running preflight_put_credit_spread first.
+    ⚠️ This executes a real trade. Before submitting, the server preflights this
+    exact spread and refuses it if the preflight fails or breaks a configured
+    limit; when the client supports it, the user is asked to confirm. A refused
+    order comes back with "submitted": false and is not sent.
 
     Args:
         sell_contract_osi: OSI symbol of the put to sell (higher strike).
@@ -2958,42 +3341,17 @@ async def place_put_credit_spread(
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
-    from datetime import datetime as dt
-
-    order_id = str(uuid4())
-    try:
-        kwargs: dict[str, Any] = {
-            "sell_contract_osi": sell_contract_osi,
-            "buy_contract_osi": buy_contract_osi,
-            "quantity": quantity,
-            "limit_price": Decimal(limit_price),
-            "order_id": order_id,
-            "time_in_force": TimeInForce(time_in_force.upper()),
-        }
-        if expiration_time:
-            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
-
-        logger.info(
-            "Placing put credit spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
-            order_id, sell_contract_osi, buy_contract_osi, quantity, limit_price,
-        )
-        async with _get_client(account_id) as client:
-            new_order = await client.place_put_credit_spread(account_id=account_id, **kwargs)
-        logger.info("Put credit spread accepted: order_id=%s returned=%s", order_id, new_order.order_id)
-        return json.dumps(
-            {
-                "order_id": new_order.order_id,
-                "status": "submitted",
-                "message": "Order submitted. Use get_order to confirm status.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        logger.error("place_put_credit_spread failed (order_id=%s): %s", order_id, e, exc_info=True)
-        return json.dumps(
-            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
-            indent=2,
-        )
+    return await _place_vertical_spread(
+        "put_credit",
+        ctx,
+        sell_contract_osi=sell_contract_osi,
+        buy_contract_osi=buy_contract_osi,
+        quantity=quantity,
+        limit_price=limit_price,
+        time_in_force=time_in_force,
+        expiration_time=expiration_time,
+        account_id=account_id,
+    )
 
 
 @mcp.tool(
@@ -3013,12 +3371,16 @@ async def place_put_debit_spread(
     time_in_force: str = "DAY",
     expiration_time: str | None = None,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Place a Bear Put Spread (put debit spread).
 
     Buy a higher-strike put, sell a lower-strike put. Pays a net debit.
-    ⚠️ This executes a real trade. Consider running preflight_put_debit_spread first.
+    ⚠️ This executes a real trade. Before submitting, the server preflights this
+    exact spread and refuses it if the preflight fails or breaks a configured
+    limit; when the client supports it, the user is asked to confirm. A refused
+    order comes back with "submitted": false and is not sent.
 
     Args:
         sell_contract_osi: OSI symbol of the put to sell (lower strike).
@@ -3029,42 +3391,17 @@ async def place_put_debit_spread(
         expiration_time: Required when time_in_force is GTD. ISO 8601 format.
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
-    from datetime import datetime as dt
-
-    order_id = str(uuid4())
-    try:
-        kwargs: dict[str, Any] = {
-            "sell_contract_osi": sell_contract_osi,
-            "buy_contract_osi": buy_contract_osi,
-            "quantity": quantity,
-            "limit_price": Decimal(limit_price),
-            "order_id": order_id,
-            "time_in_force": TimeInForce(time_in_force.upper()),
-        }
-        if expiration_time:
-            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
-
-        logger.info(
-            "Placing put debit spread: order_id=%s sell=%s buy=%s qty=%d limit=%s",
-            order_id, sell_contract_osi, buy_contract_osi, quantity, limit_price,
-        )
-        async with _get_client(account_id) as client:
-            new_order = await client.place_put_debit_spread(account_id=account_id, **kwargs)
-        logger.info("Put debit spread accepted: order_id=%s returned=%s", order_id, new_order.order_id)
-        return json.dumps(
-            {
-                "order_id": new_order.order_id,
-                "status": "submitted",
-                "message": "Order submitted. Use get_order to confirm status.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        logger.error("place_put_debit_spread failed (order_id=%s): %s", order_id, e, exc_info=True)
-        return json.dumps(
-            {"order_id": order_id, "status": "error", "message": f"Order submission failed: {e}"},
-            indent=2,
-        )
+    return await _place_vertical_spread(
+        "put_debit",
+        ctx,
+        sell_contract_osi=sell_contract_osi,
+        buy_contract_osi=buy_contract_osi,
+        quantity=quantity,
+        limit_price=limit_price,
+        time_in_force=time_in_force,
+        expiration_time=expiration_time,
+        account_id=account_id,
+    )
 
 
 @mcp.tool(
@@ -3086,11 +3423,15 @@ async def place_short_order(
     expiration_time: str | None = None,
     equity_market_session: str | None = None,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Place an equity short-sale order.
 
-    ⚠️ This executes a real trade. Consider running preflight_short_order first.
+    ⚠️ This executes a real trade. Before submitting, the server preflights this
+    exact order and refuses it if the preflight fails or breaks a configured
+    limit; when the client supports it, the user is asked to confirm. A refused
+    order comes back with "submitted": false and is not sent.
 
     Args:
         symbol: Ticker symbol to short (e.g. "AAPL").
@@ -3121,7 +3462,6 @@ async def place_short_order(
         kwargs: dict[str, Any] = {
             "symbol": symbol,
             "quantity": Decimal(quantity),
-            "order_id": order_id,
             "order_type": OrderType(order_type.upper()),
             "time_in_force": TimeInForce(time_in_force.upper()),
         }
@@ -3134,17 +3474,31 @@ async def place_short_order(
         if equity_market_session:
             kwargs["equity_market_session"] = EquityMarketSession(equity_market_session.upper())
 
-        logger.info(
-            "Placing short order: order_id=%s symbol=%s qty=%s type=%s",
-            order_id, symbol, quantity, order_type,
-        )
+        summary = [
+            f"SELL SHORT {quantity} {symbol} (EQUITY)",
+            _order_terms(order_type, limit_price, stop_price, time_in_force),
+            _account_line(account_id),
+        ]
         async with _get_client(account_id) as client:
-            new_order = await client.place_short_order(account_id=account_id, **kwargs)
+            gate = await _gate_order(
+                ctx,
+                summary=summary,
+                quantity=Decimal(quantity),
+                run_preflight=lambda: client.preflight_short_order(account_id=account_id, **kwargs),
+            )
+            logger.info(
+                "Placing short order: order_id=%s symbol=%s qty=%s type=%s",
+                order_id, symbol, quantity, order_type,
+            )
+            new_order = await client.place_short_order(
+                account_id=account_id, order_id=order_id, **kwargs
+            )
         logger.info("Short order accepted: order_id=%s returned=%s", order_id, new_order.order_id)
         return json.dumps(
             {
                 "order_id": new_order.order_id,
                 "status": "submitted",
+                **gate,
                 "message": (
                     "Short order submitted. Placement is asynchronous — "
                     "use get_order to confirm status."
@@ -3152,6 +3506,9 @@ async def place_short_order(
             },
             indent=2,
         )
+    except _OrderBlocked as blocked:
+        logger.warning("place_short_order blocked (order_id=%s): %s", order_id, blocked.status)
+        return blocked.to_json()
     except Exception as e:
         logger.error("place_short_order failed (order_id=%s): %s", order_id, e, exc_info=True)
         return json.dumps(
@@ -3187,6 +3544,7 @@ async def flatten_and_go_short(
     equity_market_session: str | None = None,
     flatten_timeout: float = 60.0,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Sell any existing long position in a symbol, then place a short-sale order.
@@ -3195,8 +3553,17 @@ async def flatten_and_go_short(
     may change between the flatten fill and the short entry. Both orders execute
     as real trades.
 
-    If no long position exists the flatten step is skipped and only the short
-    order is placed.
+    Each order is preflighted just before it is sent. The server preflights the
+    flatten (a MARKET sell of the whole long position) and asks the user to
+    confirm the whole workflow when the client supports it. After the flatten
+    fills, it preflights the short and checks it against the configured limits.
+    If that check fails, the short is not placed and the account is left flat:
+    the response then has status "flattened_not_shorted" and the flatten's
+    order ID. If the user cancels or the first preflight fails, the response
+    has "submitted": false and nothing is sent.
+
+    If no long position exists the flatten step is skipped, and the short is
+    preflighted and confirmed like place_short_order.
 
     Args:
         symbol: Ticker symbol (e.g. "AAPL").
@@ -3212,7 +3579,28 @@ async def flatten_and_go_short(
         flatten_timeout: Seconds to wait for the flatten order to fill (default 60).
         account_id: Account ID. Optional if PUBLIC_COM_ACCOUNT_ID is set.
     """
+    # The workflow is run here rather than through the SDK's flatten_and_go_short,
+    # which places both orders in one call and leaves no point between them to
+    # preflight the short. It follows the SDK's steps: flatten the whole long at
+    # MARKET, wait for the fill, check the position is flat, then short.
     from datetime import datetime as dt
+
+    sym = symbol.strip().upper()
+    flatten_order_id: str | None = None  # set once the flatten has been sent
+
+    def _after_flatten(status: str, message: str, **extra: Any) -> str:
+        """The response for a workflow that sent the flatten but not the short."""
+        return json.dumps(
+            {
+                "symbol": sym,
+                "status": status,
+                "flatten_order_id": flatten_order_id,
+                "short_order_id": None,
+                "message": message,
+                **extra,
+            },
+            indent=2,
+        )
 
     try:
         _validate_order_params(
@@ -3224,51 +3612,179 @@ async def flatten_and_go_short(
             time_in_force=time_in_force,
             expiration_time=expiration_time,
         )
-        kwargs: dict[str, Any] = {
-            "symbol": symbol,
-            "short_quantity": Decimal(short_quantity),
+        short_qty = Decimal(short_quantity)
+        # The short order's fields, shared by its preflight and the order itself.
+        short_kwargs: dict[str, Any] = {
+            "symbol": sym,
+            "quantity": short_qty,
             "order_type": OrderType(order_type.upper()),
             "time_in_force": TimeInForce(time_in_force.upper()),
-            "flatten_timeout": flatten_timeout,
         }
         if limit_price is not None:
-            kwargs["limit_price"] = Decimal(limit_price)
+            short_kwargs["limit_price"] = Decimal(limit_price)
         if stop_price is not None:
-            kwargs["stop_price"] = Decimal(stop_price)
+            short_kwargs["stop_price"] = Decimal(stop_price)
         if expiration_time:
-            kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
-        if equity_market_session:
-            kwargs["equity_market_session"] = EquityMarketSession(equity_market_session.upper())
-
-        logger.info(
-            "Flatten-and-go-short: symbol=%s short_qty=%s type=%s",
-            symbol, short_quantity, order_type,
+            short_kwargs["expiration_time"] = dt.fromisoformat(expiration_time)
+        session = (
+            EquityMarketSession(equity_market_session.upper()) if equity_market_session else None
         )
+        if session:
+            short_kwargs["equity_market_session"] = session
+
+        short_line = (
+            f"SELL SHORT {short_qty} {sym} (EQUITY), "
+            + _order_terms(order_type, limit_price, stop_price, time_in_force)
+        )
+
         async with _get_client(account_id) as client:
-            result = await client.flatten_and_go_short(account_id=account_id, **kwargs)
 
-        flatten_order_id = result.flatten_order.order_id if result.flatten_order else None
-        logger.info(
-            "Flatten-and-go-short complete: symbol=%s flatten_order_id=%s short_order_id=%s",
-            symbol, flatten_order_id, result.short_order.order_id,
-        )
-        return json.dumps(
-            {
-                "short_order_id": result.short_order.order_id,
-                "flatten_order_id": flatten_order_id,
-                "initial_position_quantity": str(result.initial_position_quantity),
-                "status": "submitted",
-                "message": (
-                    "Short order submitted. Use get_order to confirm status. "
-                    "Note: this was a two-order workflow — verify both orders filled as expected."
+            def preflight_short() -> Awaitable[Any]:
+                return client.preflight_short_order(account_id=account_id, **short_kwargs)
+
+            async def place_short(gate: dict[str, Any], initial_quantity: Decimal) -> str:
+                short_order_id = str(uuid4())
+                logger.info(
+                    "Flatten-and-go-short placing short: symbol=%s qty=%s order_id=%s",
+                    sym, short_qty, short_order_id,
+                )
+                short_order = await client.place_short_order(
+                    account_id=account_id, order_id=short_order_id, **short_kwargs
+                )
+                return json.dumps(
+                    {
+                        "short_order_id": short_order.order_id,
+                        "flatten_order_id": flatten_order_id,
+                        "initial_position_quantity": str(initial_quantity),
+                        "status": "submitted",
+                        **gate,
+                        "message": (
+                            "Short order submitted. Use get_order to confirm status. "
+                            "Note: this was a two-order workflow — verify both orders "
+                            "filled as expected."
+                        ),
+                    },
+                    indent=2,
+                )
+
+            portfolio = await client.get_portfolio(account_id=account_id)
+            initial_quantity = _long_equity_quantity(portfolio, sym)
+
+            if initial_quantity <= 0:
+                # Nothing to flatten: this is an ordinary short order.
+                gate = await _gate_order(
+                    ctx,
+                    summary=[short_line, _account_line(account_id)],
+                    quantity=short_qty,
+                    run_preflight=preflight_short,
+                )
+                return await place_short(gate, initial_quantity)
+
+            # Step 1: the flatten. It only closes a position, so the value limit
+            # doesn't apply, but the quantity limit is checked against the short
+            # now, so a too-large short is refused before anything is sold.
+            flatten_kwargs: dict[str, Any] = {
+                "instrument": OrderInstrument(symbol=sym, type=InstrumentType.EQUITY),
+                "order_side": OrderSide.SELL,
+                "open_close_indicator": OpenCloseIndicator.CLOSE,
+                "order_type": OrderType.MARKET,
+                "expiration": OrderExpirationRequest(time_in_force=TimeInForce.DAY),
+                "quantity": initial_quantity,
+            }
+            if session:
+                flatten_kwargs["equity_market_session"] = session
+            flatten_gate = await _gate_order(
+                ctx,
+                summary=[
+                    f"1. SELL {initial_quantity} {sym} at MARKET, closing your whole long position",
+                    f"2. Once that fills: {short_line}",
+                    "The short gets its own preflight and limit checks after step 1 fills. "
+                    "If it fails them, you are left with no position.",
+                    _account_line(account_id),
+                    "The preflight estimate below is for step 1.",
+                ],
+                quantity=short_qty,
+                run_preflight=lambda: client.perform_preflight_calculation(
+                    preflight_request=PreflightRequest(**flatten_kwargs), account_id=account_id
                 ),
-            },
-            indent=2,
-        )
+                enforce_value_limit=False,
+            )
+
+            new_flatten_id = str(uuid4())
+            logger.info(
+                "Flatten-and-go-short placing flatten: symbol=%s qty=%s order_id=%s",
+                sym, initial_quantity, new_flatten_id,
+            )
+            flatten_order = await client.place_order(
+                order_request=OrderRequest(order_id=new_flatten_id, **flatten_kwargs),
+                account_id=account_id,
+            )
+            flatten_order_id = flatten_order.order_id
+
+            try:
+                await flatten_order.wait_for_fill(timeout=flatten_timeout)
+            except WaitTimeoutError:
+                return _after_flatten(
+                    "flatten_not_filled",
+                    f"The flatten order did not fill within {flatten_timeout} seconds, so the "
+                    "short was not placed. The flatten order may still be working: check it "
+                    "with get_order and cancel it with cancel_order if needed.",
+                )
+
+            refreshed = await client.get_portfolio(account_id=account_id)
+            remaining = _long_equity_quantity(refreshed, sym)
+            if remaining > 0:
+                return _after_flatten(
+                    "flatten_incomplete",
+                    f"{remaining} shares of {sym} are still held after the flatten, so the "
+                    "short was not placed.",
+                )
+
+            # Step 2: the short, preflighted now that the account is flat. The
+            # user confirmed it as part of the workflow, so no second prompt.
+            try:
+                short_gate = await _gate_order(
+                    ctx,
+                    summary=[short_line],
+                    quantity=short_qty,
+                    run_preflight=preflight_short,
+                    confirm=False,
+                )
+            except _OrderBlocked as blocked:
+                logger.warning(
+                    "flatten_and_go_short short blocked after flatten (symbol=%s): %s",
+                    sym, blocked.status,
+                )
+                return _after_flatten(
+                    "flattened_not_shorted",
+                    f"The long position was sold, but the short was not placed: "
+                    f"{blocked.message} The account now has no {sym} position.",
+                    short_blocked_reason=blocked.status,
+                    short_preflight=blocked.preflight,
+                )
+
+            return await place_short(
+                {
+                    "flatten_preflight": flatten_gate["preflight"],
+                    "preflight": short_gate["preflight"],
+                    "confirmation": flatten_gate["confirmation"],
+                },
+                initial_quantity,
+            )
+    except _OrderBlocked as blocked:
+        logger.warning("flatten_and_go_short blocked (symbol=%s): %s", sym, blocked.status)
+        return blocked.to_json()
     except Exception as e:
-        logger.error("flatten_and_go_short failed (symbol=%s): %s", symbol, e, exc_info=True)
+        logger.error("flatten_and_go_short failed (symbol=%s): %s", sym, e, exc_info=True)
+        if flatten_order_id is not None:
+            return _after_flatten(
+                "error",
+                f"Flatten-and-go-short failed after the flatten order was sent: {e}. "
+                f"Check the flatten with get_order({flatten_order_id!r}); the short was "
+                "not confirmed as placed.",
+            )
         return json.dumps(
-            {"symbol": symbol, "status": "error", "message": f"Flatten-and-go-short failed: {e}"},
+            {"symbol": sym, "status": "error", "message": f"Flatten-and-go-short failed: {e}"},
             indent=2,
         )
 
@@ -3336,11 +3852,16 @@ async def cancel_and_replace_order(
     stop_price: str | None = None,
     expiration_time: str | None = None,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Atomically cancel an existing order and replace it with new parameters.
 
-    ⚠️ This modifies an existing order.
+    ⚠️ This modifies an existing order. Before submitting, the server looks up the
+    original order, preflights the replacement and refuses it if the preflight
+    fails or breaks a configured limit; when the client supports it, the user is
+    asked to confirm. A refused request comes back with "submitted": false and
+    the original order is left as it was.
 
     Supported for equity, option, and crypto quantity orders.
 
@@ -3394,11 +3915,68 @@ async def cancel_and_replace_order(
             req_kwargs["stop_price"] = Decimal(stop_price)
 
         req = CancelAndReplaceRequest(**req_kwargs)
-        logger.info(
-            "Cancel-replace: original_order_id=%s request_id=%s type=%s",
-            order_id, request_id, order_type,
-        )
+
         async with _get_client(account_id) as client:
+            summary: list[str] = []
+
+            async def preflight_replacement() -> Any:
+                # The replacement keeps the original's instrument and side, so
+                # those come from the original order — as does its size when the
+                # replacement only changes the price. (A size kept from the
+                # original is not re-checked against the quantity limit: repricing
+                # an existing order does not enlarge it.)
+                original = await client.get_order(order_id=order_id, account_id=account_id)
+                pf_size: dict[str, Decimal] = {}
+                if "quantity" in req_kwargs:
+                    pf_size["quantity"] = req_kwargs["quantity"]
+                elif "amount" in req_kwargs:
+                    pf_size["amount"] = req_kwargs["amount"]
+                elif original.quantity is not None:
+                    pf_size["quantity"] = original.quantity
+                elif original.notional_value is not None:
+                    pf_size["amount"] = original.notional_value
+                size = (
+                    f"{pf_size['quantity']}" if "quantity" in pf_size
+                    else f"${pf_size.get('amount')} of"
+                )
+                summary[:] = [
+                    f"Replace order {order_id} with: {original.side.value} {size} "
+                    f"{original.instrument.symbol} ({original.instrument.type.value}"
+                    + (
+                        f", {original.open_close_indicator.value}"
+                        if original.open_close_indicator
+                        else ""
+                    )
+                    + ")",
+                    _order_terms(order_type, limit_price, stop_price, time_in_force),
+                    _account_line(account_id),
+                ]
+                pf_kwargs: dict[str, Any] = {
+                    "instrument": original.instrument,
+                    "order_side": original.side,
+                    "order_type": req_kwargs["order_type"],
+                    "expiration": req_kwargs["expiration"],
+                    **pf_size,
+                }
+                for field in ("limit_price", "stop_price"):
+                    if field in req_kwargs:
+                        pf_kwargs[field] = req_kwargs[field]
+                if original.open_close_indicator:
+                    pf_kwargs["open_close_indicator"] = original.open_close_indicator
+                return await client.perform_preflight_calculation(
+                    preflight_request=PreflightRequest(**pf_kwargs), account_id=account_id
+                )
+
+            gate = await _gate_order(
+                ctx,
+                summary=summary,
+                quantity=Decimal(quantity) if quantity is not None else None,
+                run_preflight=preflight_replacement,
+            )
+            logger.info(
+                "Cancel-replace: original_order_id=%s request_id=%s type=%s",
+                order_id, request_id, order_type,
+            )
             new_order = await client.cancel_and_replace_order(
                 request=req, account_id=account_id
             )
@@ -3411,6 +3989,7 @@ async def cancel_and_replace_order(
                 "new_order_id": new_order.order_id,
                 "cancelled_order_id": order_id,
                 "status": "submitted",
+                **gate,
                 "message": (
                     "Cancel-and-replace submitted. Use get_order to "
                     "confirm the new order status."
@@ -3418,6 +3997,12 @@ async def cancel_and_replace_order(
             },
             indent=2,
         )
+    except _OrderBlocked as blocked:
+        logger.warning(
+            "cancel_and_replace_order blocked (original_order_id=%s): %s",
+            order_id, blocked.status,
+        )
+        return blocked.to_json()
     except Exception as e:
         logger.error(
             "cancel_and_replace_order failed (original_order_id=%s request_id=%s): %s",
@@ -3452,15 +4037,18 @@ async def buy_event_contract(
     limit_price: str | None = None,
     event_symbol: str | None = None,
     account_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """
     Buy an event contract (a YES or NO side of a prediction market) with a DAY
     limit order.
 
-    ⚠️ This executes a real trade. Consider running preflight_buy_event_contract
-    first. For a recurring market such as a 15-minute window, find the window with
-    get_current_event, its contracts with get_event_details, and the result with
-    wait_for_settlement.
+    ⚠️ This executes a real trade. Before submitting, the server preflights this
+    exact order and refuses it if the preflight fails or breaks a configured
+    limit; when the client supports it, the user is asked to confirm. A refused
+    order comes back with "submitted": false and is not sent. For a recurring
+    market such as a 15-minute window, find the window with get_current_event,
+    its contracts with get_event_details, and the result with wait_for_settlement.
 
     Args:
         contract_symbol: The contract to buy, from get_event_details, e.g.
@@ -3480,6 +4068,18 @@ async def buy_event_contract(
     try:
         async with _get_client(account_id) as client:
             price = await _resolve_event_contract_buy(client, symbol, limit_price, event_symbol)
+            gate = await _gate_order(
+                ctx,
+                summary=[
+                    f"BUY {quantity} {symbol} (event contract)",
+                    f"LIMIT, limit {price}, DAY",
+                    _account_line(account_id),
+                ],
+                quantity=Decimal(quantity),
+                run_preflight=lambda: client.preflight_buy_event_contract(
+                    symbol, Decimal(quantity), limit_price=price, account_id=account_id
+                ),
+            )
             logger.info(
                 "Buying event contract: order_id=%s contract=%s qty=%s limit=%s",
                 order_id, symbol, quantity, price,
@@ -3499,6 +4099,7 @@ async def buy_event_contract(
                 "contract_symbol": symbol,
                 "quantity": quantity,
                 "limit_price": str(price),
+                **gate,
                 "message": (
                     "Order submitted. Placement is asynchronous — use "
                     "get_order to confirm status."
@@ -3506,6 +4107,9 @@ async def buy_event_contract(
             },
             indent=2,
         )
+    except _OrderBlocked as blocked:
+        logger.warning("buy_event_contract blocked (order_id=%s): %s", order_id, blocked.status)
+        return blocked.to_json()
     except Exception as e:
         logger.error("buy_event_contract failed (order_id=%s): %s", order_id, e, exc_info=True)
         return json.dumps(
@@ -3556,6 +4160,33 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 # Entry point
 # ========================================================================
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _apply_read_only_mode() -> list[str]:
+    """Unregister every tool not marked read-only when PUBLIC_COM_READ_ONLY is set.
+
+    Goes by the readOnlyHint annotation rather than a list of names, so a write
+    tool added later is removed too unless it is explicitly marked read-only.
+    Returns the names removed.
+    """
+    if not _env_flag("PUBLIC_COM_READ_ONLY"):
+        return []
+    removed = [
+        tool.name
+        for tool in mcp._tool_manager.list_tools()
+        if not (tool.annotations and tool.annotations.readOnlyHint is True)
+    ]
+    for name in removed:
+        if hasattr(mcp, "remove_tool"):
+            mcp.remove_tool(name)
+        else:  # mcp releases before FastMCP.remove_tool
+            mcp._tool_manager._tools.pop(name, None)
+    logger.info("PUBLIC_COM_READ_ONLY is set; removed write tools: %s", ", ".join(removed))
+    return removed
+
+
 def main():
     """Run the MCP server.
 
@@ -3567,6 +4198,7 @@ def main():
     """
     import uvicorn
 
+    _apply_read_only_mode()
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
 
     if transport == "stdio":
