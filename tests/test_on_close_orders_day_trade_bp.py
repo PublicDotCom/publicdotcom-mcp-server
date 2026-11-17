@@ -216,7 +216,7 @@ class TestOnCloseRequests:
         assert _body(req)["orderType"] == "LIMIT_ON_CLOSE"
         assert _body(req)["limitPrice"] == "227.50"
 
-    async def test_cancel_and_replace_to_limit_on_close(self, patch_get_client):
+    async def test_cancel_and_replace_to_limit_on_close(self, patch_get_client, original_order):
         patch_get_client.cancel_and_replace_order = AsyncMock(return_value=_new_order())
 
         data = json.loads(
@@ -235,7 +235,7 @@ class TestOnCloseRequests:
         assert body["orderType"] == "LIMIT_ON_CLOSE"
         assert body["limitPrice"] == "227.50"
 
-    async def test_cancel_and_replace_to_market_on_close(self, patch_get_client):
+    async def test_cancel_and_replace_to_market_on_close(self, patch_get_client, original_order):
         patch_get_client.cancel_and_replace_order = AsyncMock(return_value=_new_order())
 
         await cancel_and_replace_order(
@@ -333,6 +333,7 @@ class TestOnCloseRulesOwnedBySdk:
 
     async def test_short_order_built_by_sdk_carries_the_on_close_type(self, sdk_client):
         sdk_client.place_order = AsyncMock(return_value=_new_order())
+        sdk_client.perform_preflight_calculation = AsyncMock()
 
         await place_short_order(
             symbol="AAPL", quantity="5", order_type="LIMIT_ON_CLOSE", limit_price="230"
@@ -595,6 +596,9 @@ class TestGatewayErrorText:
                 )
             )
 
-        assert data["status"] == "error"
+        # The gateway's text surfaces from the preflight the order gate runs first,
+        # which stops the order before it is sent.
+        assert data["status"] == "preflight_failed"
+        assert data["submitted"] is False
         assert "Market is closed" in data["message"]
         assert "Unknown error" not in data["message"]

@@ -285,20 +285,43 @@ class TestPreflightMultilegOrder:
 
 
 class TestFlattenAndGoShort:
+    """flatten_and_go_short runs the SDK's workflow step by step so each order can
+    be gated; the workflow's edge cases are in test_order_gate.py."""
+
     @staticmethod
-    def _result(flatten_order_id="flatten-order-uuid", initial_position_quantity="10"):
-        result = MagicMock()
-        result.short_order.order_id = "short-order-uuid"
-        result.initial_position_quantity = initial_position_quantity
-        if flatten_order_id is None:
-            result.flatten_order = None
-        else:
-            result.flatten_order.order_id = flatten_order_id
-        return result
+    def _portfolio(quantity: str):
+        from types import SimpleNamespace
+
+        from public_api_sdk import InstrumentType, OrderInstrument
+
+        if Decimal(quantity) == 0:
+            return SimpleNamespace(positions=[])
+        return SimpleNamespace(
+            positions=[
+                SimpleNamespace(
+                    instrument=OrderInstrument(symbol="AAPL", type=InstrumentType.EQUITY),
+                    quantity=Decimal(quantity),
+                )
+            ]
+        )
+
+    @staticmethod
+    def _order(order_id: str):
+        order = MagicMock()
+        order.order_id = order_id
+        order.wait_for_fill = AsyncMock()
+        return order
+
+    def _setup(self, client, held: str = "10"):
+        client.get_portfolio = AsyncMock(
+            side_effect=[self._portfolio(held), self._portfolio("0")]
+        )
+        client.place_order = AsyncMock(return_value=self._order("flatten-order-uuid"))
+        client.place_short_order = AsyncMock(return_value=self._order("short-order-uuid"))
+        return client
 
     async def test_successful_flatten_and_short(self, patch_get_client):
-        mock_client = patch_get_client
-        mock_client.flatten_and_go_short = AsyncMock(return_value=self._result())
+        self._setup(patch_get_client)
 
         result = await flatten_and_go_short(symbol="AAPL", short_quantity="5")
         data = json.loads(result)
@@ -310,20 +333,17 @@ class TestFlattenAndGoShort:
 
     async def test_no_existing_position_reports_null_flatten_order(self, patch_get_client):
         """With no long position the flatten step is skipped, not failed."""
-        mock_client = patch_get_client
-        mock_client.flatten_and_go_short = AsyncMock(
-            return_value=self._result(flatten_order_id=None, initial_position_quantity="0")
-        )
+        self._setup(patch_get_client, held="0")
 
         result = await flatten_and_go_short(symbol="AAPL", short_quantity="5")
         data = json.loads(result)
         assert data["status"] == "submitted"
         assert data["flatten_order_id"] is None
         assert data["short_order_id"] == "short-order-uuid"
+        patch_get_client.place_order.assert_not_called()
 
     async def test_decimal_and_enum_coercion_passed_to_client(self, patch_get_client):
-        mock_client = patch_get_client
-        mock_client.flatten_and_go_short = AsyncMock(return_value=self._result())
+        mock_client = self._setup(patch_get_client)
 
         await flatten_and_go_short(
             symbol="AAPL",
@@ -332,11 +352,15 @@ class TestFlattenAndGoShort:
             limit_price="150.25",
             flatten_timeout=30.0,
         )
-        kwargs = mock_client.flatten_and_go_short.await_args.kwargs
-        assert kwargs["short_quantity"] == Decimal("5")
+        kwargs = mock_client.place_short_order.await_args.kwargs
+        assert kwargs["quantity"] == Decimal("5")
         assert kwargs["limit_price"] == Decimal("150.25")
         assert kwargs["order_type"].value == "LIMIT"
-        assert kwargs["flatten_timeout"] == 30.0
+        flatten = mock_client.place_order.await_args.kwargs["order_request"]
+        assert flatten.quantity == Decimal("10")
+        assert flatten.order_type.value == "MARKET"
+        assert flatten.open_close_indicator.value == "CLOSE"
+        mock_client.place_order.return_value.wait_for_fill.assert_awaited_once_with(timeout=30.0)
 
     async def test_validation_error_for_limit_without_price(self, patch_get_client):
         result = await flatten_and_go_short(
@@ -362,7 +386,7 @@ class TestFlattenAndGoShort:
 
     async def test_api_error_returns_error_json_with_symbol(self, patch_get_client):
         mock_client = patch_get_client
-        mock_client.flatten_and_go_short = AsyncMock(side_effect=Exception("flatten timed out"))
+        mock_client.get_portfolio = AsyncMock(side_effect=Exception("flatten timed out"))
 
         result = await flatten_and_go_short(symbol="AAPL", short_quantity="5")
         data = json.loads(result)
@@ -392,7 +416,7 @@ class TestCancelOrder:
 
 
 class TestCancelAndReplaceOrder:
-    async def test_successful_cancel_and_replace(self, patch_get_client):
+    async def test_successful_cancel_and_replace(self, patch_get_client, original_order):
         mock_client = patch_get_client
         mock_result = MagicMock()
         mock_result.order_id = "new-order-uuid"
@@ -408,7 +432,7 @@ class TestCancelAndReplaceOrder:
         assert data["new_order_id"] == "new-order-uuid"
         assert data["cancelled_order_id"] == "00000000-0000-4000-a000-000000000001"
 
-    async def test_api_error_returns_error_json_with_original_order_id(self, patch_get_client):
+    async def test_api_error_returns_error_json_with_original_order_id(self, patch_get_client, original_order):
         mock_client = patch_get_client
         mock_client.cancel_and_replace_order = AsyncMock(side_effect=Exception("rejected"))
 
@@ -443,7 +467,7 @@ class TestCancelAndReplaceOrder:
         assert data["status"] == "error"
         assert "expiration_time" in data["message"]
 
-    async def test_amount_replaces_for_notional_value(self, patch_get_client):
+    async def test_amount_replaces_for_notional_value(self, patch_get_client, original_order):
         mock_client = patch_get_client
         mock_result = MagicMock()
         mock_result.order_id = "new-order-uuid"

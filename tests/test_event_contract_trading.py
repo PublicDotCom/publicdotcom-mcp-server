@@ -356,6 +356,7 @@ class TestBuyEventContract:
         new_order = AsyncMock()
         new_order.order_id = "returned-id"
         patch_get_client.buy_event_contract = AsyncMock(return_value=new_order)
+        patch_get_client.preflight_buy_event_contract = AsyncMock(return_value=_preflight())
 
         data = json.loads(await buy_event_contract(NO, "3", limit_price="0.47"))
 
@@ -369,8 +370,18 @@ class TestBuyEventContract:
             "contract_symbol": NO,
             "quantity": "3",
             "limit_price": "0.47",
+            "preflight": {
+                "orderValue": "0.55",
+                "estimatedCost": "0.58",
+                "estimatedCommission": "0.02",
+            },
+            "confirmation": "client_tool_approval",
             "message": data["message"],
         }
+        # The gate preflights the same contract, quantity and price it then buys.
+        pf = patch_get_client.preflight_buy_event_contract.call_args
+        assert pf.args == (NO, Decimal("3"))
+        assert pf.kwargs["limit_price"] == Decimal("0.47")
 
     async def test_omitted_limit_price_buys_at_the_ask(self, patch_get_client):
         new_order = AsyncMock()
@@ -446,6 +457,7 @@ class TestRequestsSentByTheSdk:
         new_order = AsyncMock()
         new_order.order_id = "returned-id"
         sdk_client.place_order = AsyncMock(return_value=new_order)
+        sdk_client.perform_preflight_calculation = AsyncMock(return_value=_preflight())
 
         await buy_event_contract(NO, "1", limit_price="0.47")
 

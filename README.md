@@ -66,6 +66,27 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that c
 | `cancel_order` | Cancel an existing order |
 | `cancel_and_replace_order` | Atomically cancel and replace an order |
 
+Every tool above except `cancel_order` runs the order through the [order gate](#order-safety) before anything is sent.
+
+### Order safety
+
+The server, not the model, decides whether an order goes out. Every order tool (all the write tools except `cancel_order`) does this before it sends anything:
+
+1. **Limits.** It refuses an order that breaks a limit the operator set in the environment (see below). The model can't change these settings from the chat.
+2. **Preflight.** It preflights the exact order it is about to submit, using the same request it would send. If the preflight fails, the order is not sent. `cancel_and_replace_order` looks up the original order to preflight the replacement, and a bracket order's preflight covers only its entry order. `flatten_and_go_short` preflights each of its two orders just before it is sent. First it preflights the flatten (a MARKET sell of the whole long position). Then, once the flatten has filled, it preflights the short and checks it against the limits. If the short fails that check, it is not placed: the account is left flat and the tool returns `flattened_not_shorted`. The value limit never applies to the flatten, because it only closes a position.
+3. **Confirmation.** If the client supports [MCP elicitation](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation), the server shows the user the order and its preflight estimate and asks them to confirm. Only the user can answer this prompt; the model can't. If the user declines or dismisses it, the order is not sent.
+
+When the server refuses an order, the tool returns `"submitted": false` with a `status` explaining why: `blocked_by_limit`, `preflight_failed`, `not_confirmed`, `confirmation_unavailable`, `confirmation_failed` or `configuration_error`. `flatten_and_go_short` can also stop after sending the flatten but before the short. It then returns the flatten's order ID with status `flatten_not_filled`, `flatten_incomplete` or `flattened_not_shorted`. When an order is sent, the response includes the `preflight` estimate and how the order was `confirmation`-ed (`user_confirmed`, `client_tool_approval` or `disabled`).
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PUBLIC_COM_ORDER_CONFIRMATION` | `auto` | `auto`: asks through elicitation when the client supports it, and otherwise relies on the client's own tool-approval prompt. `required`: refuses orders from clients that can't show the prompt. `off`: never asks (for unattended use; the preflight and limits still apply). |
+| `PUBLIC_COM_MAX_ORDER_QUANTITY` | unset | Refuses an order for more shares or contracts than this. For a multi-leg order, the count is the quantity times the largest leg ratio. |
+| `PUBLIC_COM_MAX_ORDER_VALUE` | unset | Refuses an order if the preflight's order value, estimated cost or buying power requirement is more than this many dollars. The buying power requirement is what limits a sell-to-open option or a short sale, where the order value is only the premium or proceeds received. |
+| `PUBLIC_COM_READ_ONLY` | unset | Set to `true` to remove every tool not marked read-only, so the server can't place or cancel orders at all. |
+
+If a limit is set to a value the server can't parse, every order is refused until it is fixed, so a typo can never quietly turn a limit off. The order gate adds to the client's own tool-approval prompt; it does not replace it. Keep that prompt on for order tools, especially when the model is reading untrusted content such as web pages or news.
+
 ### Order types
 
 `place_order`, `preflight_order`, `cancel_and_replace_order` and the short-sale tools
@@ -189,6 +210,12 @@ export PUBLIC_COM_SECRET=your_api_secret_key
 
 # Optional — sets a default account so you don't need to specify it each time
 export PUBLIC_COM_ACCOUNT_ID=your_account_id
+
+# Optional — order safety limits (see "Order safety" above)
+export PUBLIC_COM_MAX_ORDER_QUANTITY=100
+export PUBLIC_COM_MAX_ORDER_VALUE=5000
+export PUBLIC_COM_ORDER_CONFIRMATION=auto   # auto | required | off
+# export PUBLIC_COM_READ_ONLY=true          # disable all order tools
 ```
 
 ## Usage

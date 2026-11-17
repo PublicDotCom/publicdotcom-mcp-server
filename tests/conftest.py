@@ -24,3 +24,22 @@ def set_env_vars(monkeypatch):
     """Ensure required env vars are set for all tests."""
     monkeypatch.setenv("PUBLIC_COM_SECRET", "test-secret-key")
     monkeypatch.setenv("PUBLIC_COM_ACCOUNT_ID", "test-account-123")
+
+
+@pytest.fixture
+def original_order(patch_get_client):
+    """The existing order cancel_and_replace_order looks up to preflight its replacement."""
+    from decimal import Decimal
+    from unittest.mock import MagicMock
+
+    from public_api_sdk import InstrumentType, OrderInstrument
+    from public_api_sdk.models import OrderSide
+
+    order = MagicMock()
+    order.instrument = OrderInstrument(symbol="AAPL", type=InstrumentType.EQUITY)
+    order.side = OrderSide.BUY
+    order.open_close_indicator = None
+    order.quantity = Decimal("10")
+    order.notional_value = None
+    patch_get_client.get_order = AsyncMock(return_value=order)
+    return order
